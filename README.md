@@ -1,5 +1,7 @@
 # dsh-agent-browser
 
+English | [中文](README.zh.md)
+
 Let the model actually **use** the DSH right-Sidebar browser: read a page's text,
 click and type in it, navigate, size the viewport, and take screenshots — from
 ordinary tool calls in the conversation.
