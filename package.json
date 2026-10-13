@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Agent-driven control of the DSH right-Sidebar browser: read page content, act on it, and take screenshots from model tools (Desktop only)",
+  "description": "Agent-driven control of the DSH right-Sidebar browser: read page content, act on it, size the viewport, and take screenshots from model tools (Desktop only)",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
@@ -14,14 +14,25 @@
     "index.js",
     "client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek-harness",
     "browser",
-    "agent"
+    "agent",
+    "tools"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guanhaisen/dsh-agent-browser.git"
+  },
+  "homepage": "https://github.com/guanhaisen/dsh-agent-browser#readme",
+  "bugs": {
+    "url": "https://github.com/guanhaisen/dsh-agent-browser/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -34,6 +45,15 @@
         "@deepseek-ai/dsh-client-ui-sidebar-right"
       ]
     }
+  },
+  "scripts": {
+    "test": "node test/run-all.cjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "license": "MIT"
 }

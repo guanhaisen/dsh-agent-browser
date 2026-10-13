@@ -4,39 +4,20 @@
  * The two Electron-backed checks must run under the packaged executable in Node
  * mode, because they import the real `dsh-tools` validators out of `app.asar`.
  * This runner locates that executable and drives both, then runs the pure-Node
- * page-helper check in this process.
+ * checks in this process.
  *
- * Usage: node test/run-all.cjs ["<path to DeepSeek Harness.exe>"]
+ * Usage: node test/run-all.cjs ["<path to DeepSeek Harness.exe>"] [--offline]
+ *
+ * `--offline` skips the two checks that need a packaged install, so CI can run
+ * everything it is actually able to run instead of reporting a false failure.
+ * Skipped checks are reported as SKIP, never as PASS.
  */
 const { spawnSync } = require('node:child_process')
-const { existsSync, readdirSync } = require('node:fs')
-const { join, dirname, resolve } = require('node:path')
+const { join } = require('node:path')
+const { findExecutable } = require('./paths.cjs')
 
 const here = __dirname
-
-/** Find the packaged executable: explicit argument, env, or a nearby install. */
-function findExecutable() {
-  const candidates = []
-  if (process.argv[2]) candidates.push(process.argv[2])
-  if (process.env.DSH_DESKTOP_EXE) candidates.push(process.env.DSH_DESKTOP_EXE)
-
-  // Walk up from the plugin looking for a sibling DeepSeekHarness install.
-  let dir = here
-  for (let depth = 0; depth < 6; depth++) {
-    dir = dirname(dir)
-    for (const name of ['DeepSeekHarness', 'DeepSeek Harness']) {
-      candidates.push(join(dir, name, 'DeepSeek Harness.exe'))
-    }
-    try {
-      for (const entry of readdirSync(dir)) {
-        if (/harness/i.test(entry)) candidates.push(join(dir, entry, 'DeepSeek Harness.exe'))
-      }
-    } catch {
-      // unreadable parent; keep walking
-    }
-  }
-  return candidates.find((path) => path && existsSync(path))
-}
+const offline = process.argv.includes('--offline')
 
 const results = []
 const run = (label, command, args, options = {}) => {
@@ -49,28 +30,57 @@ const run = (label, command, args, options = {}) => {
 }
 
 const exe = findExecutable()
-if (exe === undefined) {
+
+// Checks that need no packaged install.
+const pureChecks = [
+  ['page helper behavior', 'page-helpers-check.cjs'],
+  ['enableEval gate', 'eval-gate-check.cjs'],
+  ['viewport sizing math', 'viewport-check.cjs'],
+  ['client apply wiring', 'apply-check.cjs'],
+  ['viewport controller behavior', 'viewport-controller-check.cjs'],
+]
+
+// `--offline` is authoritative, not a fallback: it means "skip the two checks
+// that need a packaged install", whether or not one happens to be findable. That
+// keeps a CI run reproducible on a machine that also has DSH installed.
+const skipPackaged = offline || exe === undefined
+
+if (exe === undefined && !offline) {
   console.error(
-    'Could not locate "DeepSeek Harness.exe".\n' +
-      'Pass it explicitly:  node test/run-all.cjs "D:\\path\\to\\DeepSeek Harness.exe"\n' +
-      'or set DSH_DESKTOP_EXE.',
+    'Could not locate "DeepSeek Harness.exe", needed by two checks that read the real\n' +
+      'dsh-tools validators out of app.asar.\n' +
+      'Pass it explicitly:  node test/run-all.cjs "/path/to/DeepSeek Harness.exe"\n' +
+      'set DSH_DESKTOP_EXE, or run with --offline to skip those two checks.',
   )
   process.exit(2)
 }
-console.log(`using executable: ${exe}`)
+if (!skipPackaged) console.log(`using executable: ${exe}`)
 
-const electronEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+// The Electron-backed checks run as their own processes, so the executable we
+// resolved here must be handed down explicitly: in those children `argv[2]` is
+// the check's own filename, not a path to the app.
+const electronEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_DESKTOP_EXE: exe ?? '' }
 
-run('tool + manifest schemas', exe, ['--expose-internals', join(here, 'schema-check.cjs')], { env: electronEnv })
-run('client half wiring', exe, ['--expose-internals', join(here, 'client-check.cjs')], { env: electronEnv })
-run('page helper behavior', process.execPath, [join(here, 'page-helpers-check.cjs')])
-run('enableEval gate', process.execPath, [join(here, 'eval-gate-check.cjs')])
-run('viewport sizing math', process.execPath, [join(here, 'viewport-check.cjs')])
-run('client apply wiring', process.execPath, [join(here, 'apply-check.cjs')])
-run('viewport controller behavior', process.execPath, [join(here, 'viewport-controller-check.cjs')])
+if (skipPackaged) {
+  const reason = offline ? '--offline' : 'no packaged install found'
+  for (const label of ['tool + manifest schemas', 'client half wiring']) {
+    results.push({ label, ok: true, status: 'skipped' })
+    process.stdout.write(`\n=== ${label} ===\nSKIPPED (${reason}: needs a packaged install)\n`)
+  }
+} else {
+  run('tool + manifest schemas', exe, ['--expose-internals', join(here, 'schema-check.cjs')], { env: electronEnv })
+  run('client half wiring', exe, ['--expose-internals', join(here, 'client-check.cjs')], { env: electronEnv })
+}
+
+for (const [label, file] of pureChecks) {
+  run(label, process.execPath, [join(here, file)])
+}
 
 console.log('\n=== summary ===')
-for (const entry of results) console.log(`${entry.ok ? 'PASS' : 'FAIL'}  ${entry.label}`)
-const failed = results.filter((entry) => !entry.ok)
+for (const entry of results) {
+  const mark = entry.status === 'skipped' ? 'SKIP' : entry.ok ? 'PASS' : 'FAIL'
+  console.log(`${mark}  ${entry.label}`)
+}
+const failed = results.filter((entry) => !entry.ok && entry.status !== 'skipped')
 console.log(failed.length === 0 ? '\nALL CHECKS PASSED' : `\n${failed.length} CHECK(S) FAILED`)
 process.exit(failed.length === 0 ? 0 : 1)

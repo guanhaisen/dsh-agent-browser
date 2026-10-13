@@ -6,9 +6,10 @@
 // Run with ELECTRON_RUN_AS_NODE=1 so Electron's asar support can read app.asar.
 const vm = require('node:vm')
 const fs = require('node:fs')
+const { asarToolsPath, pluginFile, fileUrl } = require('./paths.cjs')
 
-const ASAR_TOOLS = 'D:/App/DeepSeekHarness/resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
-const CLIENT = 'D:/VibeCoding/Deepseek/dsh/plugins/dsh-agent-browser/client.js'
+const ASAR_TOOLS = asarToolsPath()
+const CLIENT = pluginFile('client.js')
 
 /** Minimal fake DOM sufficient for the driver's lookup logic. */
 function makeFakeDom({ sessionId, tabs }) {
@@ -48,7 +49,7 @@ function makeFakeDom({ sessionId, tabs }) {
 }
 
 async function main() {
-  const tools = await import('file:///' + ASAR_TOOLS.replace(/\\/g, '/'))
+  const tools = await import(fileUrl(ASAR_TOOLS))
   const { assertSupportedJsonSchema } = tools
 
   // --- Load the browser half through a stub module loader -------------------

@@ -3,8 +3,9 @@
 // verified rather than assumed.
 const vm = require('node:vm')
 const fs = require('node:fs')
+const { pluginFile } = require('./paths.cjs')
 
-const CLIENT = 'D:/VibeCoding/Deepseek/dsh/plugins/dsh-agent-browser/client.js'
+const CLIENT = pluginFile('client.js')
 
 // --- A DOM stub with just enough surface for the helpers ---------------------
 function makeElement(tag, props = {}) {

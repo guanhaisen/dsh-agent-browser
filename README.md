@@ -1,13 +1,33 @@
 # dsh-agent-browser
 
 Let the model actually **use** the DSH right-Sidebar browser: read a page's text,
-click and type in it, navigate, and take screenshots — from ordinary tool calls
-in the conversation.
+click and type in it, navigate, size the viewport, and take screenshots — from
+ordinary tool calls in the conversation.
+
+It also adds a **phone / tablet / desktop / custom viewport switcher**, so you can
+see how a site renders at another size without leaving the app.
+
+```
+browser_navigate { url: "https://example.com" }
+browser_read     { mode: "elements" }     -> refs e1, e2, …
+browser_act      { action: "type", ref: "e1", text: "hello" }
+browser_act      { action: "click", ref: "e2" }
+browser_screenshot {}                     -> see the layout
+browser_viewport { preset: "phone" }      -> re-render at 390×844
+```
 
 > **Desktop only.** The tools drive an Electron `<webview>` guest. In Web
 > profiles the Sidebar browser is a sandboxed cross-origin `<iframe>`, whose DOM
 > cannot be read at all, so the tools answer with an explicit reason instead of
 > pretending to work.
+
+> **Third-party, non-invasive plugin.** It mounts from your DSH profile, never
+> touches `app.asar`, and leaves the built-in browser exactly as shipped.
+
+- [Install](#install) — clone, wire into your profile, restart
+- [Tools](#tools) — what the model can call
+- [Viewport sizes](#viewport-sizes-phone--desktop--custom) — the UI side
+- [Known limitations](#known-limitations) — read before filing an issue
 
 ## Tools
 
@@ -265,57 +285,157 @@ injection. Treat tool output as data to reason about, never as instructions.
 
 ## Install
 
-The plugin lives at `plugins/dsh-agent-browser` and is wired into the `desktop`
-profile:
+This is a third-party **bundle plugin**: it is loaded from your DSH profile, not
+from `app.asar`. Nothing in the installed application is modified, so an
+uninstall is exact and an app update cannot clobber it.
 
-1. `profiles/desktop/package.json` gains the dependency
-   `"dsh-agent-browser": "link:<path-to-plugin>"` and appends
-   `dsh-agent-browser` to `dsh.profile.bundles`.
-2. `node_modules/dsh-agent-browser` is a junction to the plugin directory.
-   (A plain `pnpm install` also creates it, but this profile has `github:`
-   dependencies that need network, so the junction can be made by hand.)
-3. **Restart the application.** The profile config has no watcher, so a new
-   loader row takes effect on the next launch. Changes to `client.js` alone need
-   only a page refresh.
+1. **Clone it somewhere permanent** (not inside the app install):
+
+   ```bash
+   git clone https://github.com/guanhaisen/dsh-agent-browser.git
+   ```
+
+2. **Add it to your Desktop profile.** Edit
+   `<dsh-home>/profiles/desktop/package.json` — `<dsh-home>` is usually
+   `C:\Users\<you>\.dsh` on Windows or `~/.dsh` elsewhere:
+
+   ```json
+   {
+     "dependencies": {
+       "dsh-agent-browser": "link:/absolute/path/to/dsh-agent-browser"
+     },
+     "dsh": {
+       "profile": {
+         "bundles": [
+           "...your existing bundles...",
+           "dsh-agent-browser"
+         ]
+       }
+     }
+   }
+   ```
+
+   Both parts are required: the `link:` dependency makes the package resolvable,
+   and the `bundles` entry is what actually mounts it.
+
+3. **Make the package resolvable to Node.** Either run your profile's package
+   manager, or — if that pulls from the network you would rather avoid — create
+   the link by hand:
+
+   ```powershell
+   # Windows, from an elevated shell is NOT required
+   New-Item -ItemType Junction `
+     -Path  "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-agent-browser" `
+     -Target "<absolute path to the clone>"
+   ```
+
+   ```bash
+   # macOS / Linux
+   ln -s /absolute/path/to/dsh-agent-browser \
+         ~/.dsh/profiles/desktop/node_modules/dsh-agent-browser
+   ```
+
+4. **Enable the tools you want** in `<dsh-home>/profiles/desktop/cordis.patch.yml`
+   (optional — the defaults are safe):
+
+   ```yaml
+   - id: dsh-agent-browser
+     name: dsh-agent-browser
+     config:
+       enableEval: false        # leave false unless you want the model to run JS in pages
+       maxReadChars: 20000
+       screenshotMaxWidth: 1568
+   ```
+
+   Also raise the Inspect timeout if you take large screenshots, since a slow
+   page can exceed the 10 s default:
+
+   ```yaml
+   - id: cordis-host-runner
+     name: '@deepseek-ai/dsh-cordis-host-runner'
+     config:
+       clientInspectTimeoutMs: 60000
+   ```
+
+5. **Restart the application.** A new loader row is only read at startup.
+
+After restarting, ask the model to call `browser_tabs` — if it returns the tabs
+you have open in the right Sidebar, the plugin is live.
+
+### Where the controls appear
+
+- The model gains six tools (seven with `enableEval: true`).
+- **Right-click a browser tab** for *Viewport size* (fit / phone / tablet /
+  desktop / custom).
+- **Settings → General → Browser viewport** sets the default for new tabs.
+- `browser.viewport.cycle` is registered but **ships unbound**; bind it in
+  *Settings → Shortcuts* if you want a keyboard shortcut.
 
 ### Rollback
 
 Remove the `dsh-agent-browser` entry from `dsh.profile.bundles`, delete the
-junction, and restart. Nothing in `app.asar` is touched, so the built-in browser
-returns to exactly its shipped behavior. Backups of the two edited profile files
-are written as `*.bak-agentbrowser`.
+`node_modules/dsh-agent-browser` link, and restart. Nothing in `app.asar` is
+touched, so the built-in browser returns to exactly its shipped behavior. To keep
+the plugin but disable it temporarily, delete only the `bundles` entry.
+
+### Requirements
+
+- **Desktop app only.** The tools drive an Electron `<webview>` guest. Web
+  profiles render a sandboxed cross-origin `<iframe>` whose DOM cannot be read,
+  so the tools report an explicit reason instead of pretending to work.
+- **DSH `0.2.0-rc.2`** was the version this was built and verified against.
+  The plugin relies on public contracts (the Inspect provider registry, the
+  `sidebar.right.tab.menu.item` and `settings.general.item` seats, and the
+  `[data-sidebar-right-*]` DOM attributes), so it should survive patch updates —
+  but see *Known limitations* for what happens if a contract moves.
+- **Node 20+** to run the test suite.
 
 ## Tests
 
-```powershell
-# Everything at once (finds the executable itself, or pass it as argv[2]).
-node test\run-all.cjs '<install>\DeepSeek Harness.exe'
+Seven suites, no test framework — plain Node scripts that exit non-zero on
+failure. The executable is located automatically (a sibling install, or
+`DeepSeek Harness.exe` somewhere up the tree); normally you do not pass it.
 
-# Or individually:
-# Schema conformance against the real tool registry + client manifest.
-$env:ELECTRON_RUN_AS_NODE=1
-& '<install>\DeepSeek Harness.exe' --expose-internals test\schema-check.cjs
-& '<install>\DeepSeek Harness.exe' --expose-internals test\client-check.cjs
-
-# Page-side helper behavior (read/click/type/select/refusal paths) in a DOM stub.
-node test\page-helpers-check.cjs
-
-# The enableEval Host-side guard, including the cordis_inspect_query path.
-node test\eval-gate-check.cjs
-
-# Viewport sizing math, validation, and setViewport dispatch wiring.
-node test\viewport-check.cjs
-
-# Which element gets which inline style, fallbacks, and unmounted tabs.
-node test\viewport-controller-check.cjs
-
-# apply() wiring: the plugin must activate and register its seats, or the whole
-# client half (Inspect provider included) goes down with it.
-node test\apply-check.cjs
+```bash
+node test/run-all.cjs
 ```
 
-`ELECTRON_RUN_AS_NODE=1` is required for the first two because they import the
-real `dsh-tools` validators out of `app.asar`.
+If your install is somewhere unusual, point at it explicitly, either way:
+
+```bash
+node test/run-all.cjs "/path/to/DeepSeek Harness.exe"
+# or
+DSH_DESKTOP_EXE="/path/to/DeepSeek Harness.exe" node test/run-all.cjs
+```
+
+Two suites import the real validators out of the application's `app.asar`, so
+they cannot run without a packaged install. On a machine that has none — CI, for
+instance — pass `--offline` to skip just those two; they are reported as `SKIP`,
+never as a pass:
+
+```bash
+node test/run-all.cjs --offline
+```
+
+| Suite | What it pins down |
+|---|---|
+| `schema-check` | Every tool's raw JSON Schema against the real `dsh-tools` validator. |
+| `client-check` | The Client provider manifest, `pageCall` codegen, and guest lookup in a stub DOM. |
+| `page-helpers-check` | Read / click / type / select / refusal paths, run against a DOM stub. |
+| `eval-gate-check` | The Host-side `enableEval` guard, including the `cordis_inspect_query` bypass. |
+| `viewport-check` | Sizing math, validation and clamping, and `setViewport` dispatch wiring. |
+| `apply-check` | `apply()` activation and seat registration — if this fails, the whole client half is down. |
+| `viewport-controller-check` | Which element gets which inline style, centring, fallbacks, unmounted tabs. |
+
+Two of these must run under the packaged executable in Node mode, because they
+import the real validators out of `app.asar`; `run-all.cjs` does that for you.
+
+Several assertions exist because a bug shipped once and was only visible at
+runtime: a missing `shortcuts.register` defaults map that silently took the
+entire client half down, `jsx(type, props, key)` labels passed as the React key
+rendering blank buttons, a menu that dismissed itself because `Modal` portals
+outside the kit's click-through boundary, and a viewport height that stretched
+the page and broke `100vh`.
 
 ## Model experience
 
@@ -323,3 +443,8 @@ Seven tools enter the model-facing tool list (six with `enableEval: false`). The
 tool schemas are stable; results are lossless JSON. Screenshots add one image
 block per call, so they consume image tokens — prefer `browser_read` for text
 and reach for `browser_screenshot` when layout or visual state matters.
+
+## License
+
+[MIT](LICENSE).
+

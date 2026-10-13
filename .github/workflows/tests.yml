@@ -1,0 +1,39 @@
+name: tests
+
+# Runs the checks that need no packaged DSH install. Two suites (schema-check and
+# client-check) import the real `dsh-tools` validators out of the application's
+# `app.asar`, which is not available in CI, so the runner is invoked with
+# `--offline` and reports those two as SKIP rather than pretending they passed.
+#
+# No dependencies to install: the plugin is bundled by hand and every check is a
+# plain Node script.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The plugin targets the Desktop app on all three platforms, and its path
+        # handling is platform-sensitive, so exercise more than one.
+        os: [ubuntu-latest, windows-latest]
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        # There are none. Kept explicit so a future dependency is not forgotten.
+        run: echo "no dependencies to install"
+
+      - name: Run checks (offline)
+        run: node test/run-all.cjs --offline

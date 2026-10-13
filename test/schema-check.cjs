@@ -1,12 +1,12 @@
 // Validate the plugin's raw tool definitions against the real registry validator.
 // Run with ELECTRON_RUN_AS_NODE=1 so Electron's asar support can read app.asar.
-const { createRequire } = require('node:module')
+const { asarToolsPath, pluginFile, fileUrl } = require('./paths.cjs')
 
-const ASAR_TOOLS = 'D:/App/DeepSeekHarness/resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
-const PLUGIN = 'D:/VibeCoding/Deepseek/dsh/plugins/dsh-agent-browser/index.js'
+const ASAR_TOOLS = asarToolsPath()
+const PLUGIN = pluginFile('index.js')
 
 async function main() {
-  const tools = await import('file:///' + ASAR_TOOLS.replace(/\\/g, '/'))
+  const tools = await import(fileUrl(ASAR_TOOLS))
   const names = Object.keys(tools)
   console.log('dsh-tools exports:', names.filter((n) => /assert|validate|defineTool/i.test(n)).join(', '))
 
@@ -32,7 +32,7 @@ async function main() {
     },
   }
 
-  const plugin = await import('file:///' + PLUGIN.replace(/\\/g, '/'))
+  const plugin = await import(fileUrl(PLUGIN))
   plugin.apply(fakeCtx, { enableEval: true })
 
   console.log('\nregistered tools:', registered.map((d) => d.name).join(', '))
