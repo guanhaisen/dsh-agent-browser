@@ -1,0 +1,39 @@
+{
+  "name": "dsh-agent-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent-driven control of the DSH right-Sidebar browser: read page content, act on it, and take screenshots from model tools (Desktop only)",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "browser",
+    "agent"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-cordis-client-runner",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "license": "MIT"
+}

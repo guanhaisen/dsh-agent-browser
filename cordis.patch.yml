@@ -1,0 +1,7 @@
+# dsh-agent-browser bundle patch.
+#
+# One insert mounts the Host half (the model-facing browser tools); the browser
+# half is declared by package.json's `dsh.client` and binds to this row.
+- insert:
+    - id: dsh-agent-browser
+      name: 'dsh-agent-browser'

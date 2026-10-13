@@ -1,0 +1,1857 @@
+/**
+ * dsh-agent-browser — browser half.
+ *
+ * Registers one Client Cordis Inspect provider (`AgentBrowser`) that drives the
+ * right-Sidebar browser tabs. The page lives here, in the renderer, so this is
+ * the half that actually touches the DOM.
+ *
+ * Why this works on Desktop only
+ * ------------------------------
+ * Desktop renders each browser tab as an Electron `<webview>` guest tagged
+ * `data-sidebar-browser-frame="webview"`. The application window runs with
+ * `webviewTag: true`, so the host renderer may call `executeJavaScript` and
+ * `capturePage` on that element. Web profiles render a sandboxed cross-origin
+ * `<iframe>` instead, which cannot be read at all, so every method answers with
+ * an explicit reason rather than pretending to work.
+ *
+ * Locating a tab's guest
+ * ----------------------
+ * `ui-sidebar-right` wraps every tab body in
+ * `<div data-sidebar-right-tab="{tabId}">` inside its
+ * `[data-sidebar-right-session="{sessionId}"]` owner. Desktop browser tabs
+ * declare `keepMounted`, so a visited tab keeps its DOM across tab switches,
+ * Session switches, collapse and floating — which is what lets a tool call
+ * reach a tab the user is not currently looking at.
+ *
+ * Viewport sizing
+ * ---------------
+ * This half also owns the phone / tablet / desktop / custom viewport switcher.
+ * Its controls are additive: a `sidebar.right.tab.menu.item` entry, a
+ * `settings.general.item` row, and the `browser.viewport.cycle` shortcut. The
+ * guest element's box is the page's viewport, so sizing means setting a real
+ * pixel width on that element and scaling the result down for display.
+ *
+ * The inspected page is untrusted data. Everything this file returns is data
+ * for the model to reason about; none of it is executed as an instruction.
+ *
+ * Bundled by hand: no build step, no dependency beyond what the shell provides.
+ */
+window.__ModuleLoader__.load({
+  id: 'dsh-agent-browser',
+  factory: (require) => {
+    const module = { exports: {} }
+    const exports = module.exports
+
+    const React = require('react')
+    const { jsx, jsxs } = require('react/jsx-runtime')
+    const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+    const { defineStore } = require('@deepseek-ai/dsh-client-store')
+
+    /** Inspect provider id the Host half queries. */
+    const PROVIDER = 'AgentBrowser'
+
+    /** Maximum interactive elements returned by one read. */
+    const MAX_ELEMENTS = 300
+
+    /**
+     * Navigation settle budget, in milliseconds.
+     *
+     * Deliberately below the Inspect channel's client-query timeout (10 s by
+     * default, raisable through `cordis-host-runner.clientInspectTimeoutMs`):
+     * waiting longer than the caller's deadline only turns a clean "still
+     * loading" answer into an opaque transport timeout.
+     */
+    const NAVIGATE_SETTLE_MS = 8_000
+
+    // -----------------------------------------------------------------------
+    // Page-side helpers.
+    //
+    // Each is a self-contained function with no reference to module scope: they
+    // are serialized with toString() and evaluated inside the guest, wrapped in
+    // one IIFE so they neither need nor pollute the page's global namespace.
+    // -----------------------------------------------------------------------
+
+    /**
+     * Resolve a ref or selector to an element inside the page.
+     * @param ref - ref from a previous elements read.
+     * @param selector - explicit CSS selector.
+     * @returns the element, or a reason it could not be resolved.
+     */
+    function pageResolve(ref, selector) {
+      if (ref) {
+        const store = window.__dshAgentBrowserRefs
+        const el = store && store.get ? store.get(ref) : undefined
+        if (!el) return { reason: 'unknown-ref' }
+        if (!el.isConnected) return { reason: 'stale-ref' }
+        return { el }
+      }
+      if (selector) {
+        let el
+        try {
+          el = document.querySelector(selector)
+        } catch (error) {
+          return { reason: 'invalid-selector', detail: String(error && error.message) }
+        }
+        if (!el) return { reason: 'no-match' }
+        return { el }
+      }
+      return { reason: 'missing-target' }
+    }
+
+    /**
+     * Report the page's own identity.
+     * @returns url, title and readyState.
+     */
+    function pageIdentity() {
+      return {
+        url: location.href,
+        title: document.title || '',
+        readyState: document.readyState,
+      }
+    }
+
+    /**
+     * Return the page's visible text, normalized and bounded.
+     * @param maxChars - character budget.
+     * @returns URL, title, text, and whether the text was cut.
+     */
+    function pageReadText(maxChars) {
+      const text = document.body ? document.body.innerText || '' : ''
+      const normalized = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+      const truncated = normalized.length > maxChars
+      return {
+        url: location.href,
+        title: document.title || '',
+        text: truncated ? normalized.slice(0, maxChars) : normalized,
+        truncated,
+      }
+    }
+
+    /**
+     * Return the page's HTML, bounded.
+     * @param maxChars - character budget.
+     * @returns URL, title, html, and whether the html was cut.
+     */
+    function pageReadHtml(maxChars) {
+      const html = document.documentElement ? document.documentElement.outerHTML : ''
+      const truncated = html.length > maxChars
+      return {
+        url: location.href,
+        title: document.title || '',
+        html: truncated ? html.slice(0, maxChars) : html,
+        truncated,
+      }
+    }
+
+    /**
+     * Collect visible interactive elements, register each under a fresh `eN` ref,
+     * and return their descriptors.
+     * @param max - element budget.
+     * @returns element descriptors with the refs `act` accepts.
+     */
+    function pageReadElements(max) {
+      const store = new Map()
+      window.__dshAgentBrowserRefs = store
+
+      const visible = (el) => {
+        if (el.getClientRects().length === 0) return false
+        const style = window.getComputedStyle(el)
+        if (style.visibility === 'hidden' || style.display === 'none') return false
+        if (style.opacity === '0') return false
+        return true
+      }
+
+      const labelFor = (el) => {
+        const tag = el.tagName.toLowerCase()
+        const own =
+          el.getAttribute('aria-label') ||
+          (el.labels && el.labels.length > 0 ? el.labels[0].innerText : '') ||
+          el.getAttribute('placeholder') ||
+          el.getAttribute('title') ||
+          ''
+        if (own.trim() !== '') return own.trim().slice(0, 200)
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') return ''
+        return (el.innerText || el.textContent || '').trim().slice(0, 200)
+      }
+
+      const out = []
+      const nodes = document.querySelectorAll(
+        'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[contenteditable="true"]',
+      )
+      for (const el of nodes) {
+        if (out.length >= max) break
+        if (!visible(el)) continue
+        const ref = 'e' + (out.length + 1)
+        store.set(ref, el)
+        const tag = el.tagName.toLowerCase()
+        const type = tag === 'input' ? el.getAttribute('type') || 'text' : ''
+        const rawValue = tag === 'input' || tag === 'textarea' || tag === 'select' ? el.value : ''
+        out.push({
+          ref,
+          tag,
+          type,
+          text: labelFor(el),
+          name: el.getAttribute('name') || '',
+          value: typeof rawValue === 'string' ? rawValue.slice(0, 200) : '',
+          disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+        })
+      }
+      return {
+        url: location.href,
+        title: document.title || '',
+        elements: out,
+        truncated: nodes.length > out.length,
+      }
+    }
+
+    /**
+     * Click an element after scrolling it into view.
+     * @param ref - ref from a previous elements read.
+     * @param selector - explicit CSS selector.
+     * @returns outcome.
+     */
+    function pageClick(ref, selector) {
+      const found = pageResolve(ref, selector)
+      if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
+      const el = found.el
+      el.scrollIntoView({ block: 'center', inline: 'center' })
+      if (typeof el.focus === 'function') el.focus()
+      el.click()
+      return { ok: true, tag: el.tagName.toLowerCase(), text: (el.innerText || '').trim().slice(0, 120) }
+    }
+
+    /**
+     * Focus an element and set its value through the native setter so frameworks
+     * observing the property descriptor (React and friends) see the change.
+     * @param ref - ref from a previous elements read.
+     * @param selector - explicit CSS selector.
+     * @param text - text to enter.
+     * @returns outcome.
+     */
+    function pageType(ref, selector, text) {
+      const found = pageResolve(ref, selector)
+      if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
+      const el = found.el
+      el.scrollIntoView({ block: 'center', inline: 'center' })
+      if (typeof el.focus === 'function') el.focus()
+      const tag = el.tagName.toLowerCase()
+
+      if (tag === 'input' || tag === 'textarea') {
+        const proto = tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
+        if (descriptor && descriptor.set) descriptor.set.call(el, text)
+        else el.value = text
+      } else if (el.isContentEditable) {
+        el.textContent = text
+      } else {
+        return { ok: false, reason: 'not-editable', detail: tag }
+      }
+
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+      return { ok: true, tag, value: typeof el.value === 'string' ? el.value.slice(0, 200) : '' }
+    }
+
+    /**
+     * Dispatch one key press on an element (or the active element).
+     * @param ref - ref from a previous elements read.
+     * @param selector - explicit CSS selector.
+     * @param key - key name, such as Enter or ArrowDown.
+     * @returns outcome.
+     */
+    function pagePress(ref, selector, key) {
+      let target
+      if (ref || selector) {
+        const found = pageResolve(ref, selector)
+        if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
+        target = found.el
+      } else {
+        target = document.activeElement || document.body
+      }
+      if (target && typeof target.focus === 'function') target.focus()
+      const init = { key, code: key, bubbles: true, cancelable: true }
+      const down = new KeyboardEvent('keydown', init)
+      target.dispatchEvent(down)
+      target.dispatchEvent(new KeyboardEvent('keypress', init))
+      target.dispatchEvent(new KeyboardEvent('keyup', init))
+      // A native click for Enter/Space mirrors what a user's activation does on
+      // buttons and links, which synthetic keyboard events alone do not trigger.
+      if ((key === 'Enter' || key === ' ') && target && typeof target.click === 'function') {
+        const tag = target.tagName.toLowerCase()
+        if (tag === 'button' || tag === 'a' || target.getAttribute('role') === 'button') target.click()
+      }
+      return { ok: true, key, defaultPrevented: down.defaultPrevented }
+    }
+
+    /**
+     * Scroll the window or an element.
+     * @param ref - ref from a previous elements read.
+     * @param selector - explicit CSS selector.
+     * @param deltaX - horizontal pixels.
+     * @param deltaY - vertical pixels.
+     * @returns outcome.
+     */
+    function pageScroll(ref, selector, deltaX, deltaY) {
+      if (ref || selector) {
+        const found = pageResolve(ref, selector)
+        if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
+        found.el.scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' })
+        return { ok: true, scope: 'element' }
+      }
+      window.scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' })
+      return { ok: true, scope: 'window' }
+    }
+
+    /**
+     * Choose an option in a `<select>`.
+     * @param ref - ref from a previous elements read.
+     * @param selector - explicit CSS selector.
+     * @param value - option value or visible label.
+     * @returns outcome.
+     */
+    function pageSelect(ref, selector, value) {
+      const found = pageResolve(ref, selector)
+      if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
+      const el = found.el
+      if (el.tagName.toLowerCase() !== 'select') return { ok: false, reason: 'not-a-select' }
+      const options = Array.from(el.options)
+      const match =
+        options.find((option) => option.value === value) || options.find((option) => option.text.trim() === value)
+      if (!match) {
+        return {
+          ok: false,
+          reason: 'no-such-option',
+          detail: options
+            .map((option) => option.value)
+            .join(', ')
+            .slice(0, 200),
+        }
+      }
+      el.value = match.value
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+      return { ok: true, value: el.value }
+    }
+
+    /**
+     * Evaluate caller-supplied JavaScript in the page.
+     * @param code - expression or statements to evaluate.
+     * @returns the JSON-serializable value, or a description of what came back.
+     */
+    function pageEval(code) {
+      const value = new Function('"use strict";return (' + code + ')')()
+      if (value === undefined) return { value: null, kind: 'undefined' }
+      if (value === null) return { value: null, kind: 'null' }
+      const kind = typeof value
+      if (kind === 'string' || kind === 'number' || kind === 'boolean') return { value, kind }
+      try {
+        return { value: JSON.parse(JSON.stringify(value)), kind }
+      } catch {
+        return { value: String(value).slice(0, 4000), kind: kind + ' (stringified)' }
+      }
+    }
+
+    /**
+     * Every page-side helper, in dependency order. `pageResolve` is referenced by
+     * the interaction helpers, so it must be declared before them.
+     */
+    const PAGE_HELPERS = [
+      pageResolve,
+      pageIdentity,
+      pageReadText,
+      pageReadHtml,
+      pageReadElements,
+      pageClick,
+      pageType,
+      pagePress,
+      pageScroll,
+      pageSelect,
+      pageEval,
+    ]
+
+    /**
+     * Build the source that runs one helper inside the guest.
+     *
+     * The helpers are serialized and wrapped in one IIFE, so they are available
+     * to each other while leaving the page's global scope untouched.
+     * @param helper - the function to call.
+     * @param args - JSON-serializable arguments.
+     * @returns source for `webview.executeJavaScript`.
+     */
+    function pageCall(helper, args) {
+      const prelude = PAGE_HELPERS.map((fn) => fn.toString()).join('\n')
+      const invocation = `(${helper.name})(${args.map((value) => JSON.stringify(value)).join(',')})`
+      return `(() => {\n${prelude}\nreturn ${invocation}\n})()`
+    }
+
+    /** Drop keys whose value is undefined so the result stays lossless JSON. */
+    function prune(value) {
+      if (Array.isArray(value)) return value.map(prune)
+      if (value === null || typeof value !== 'object') return value
+      const out = {}
+      for (const [key, item] of Object.entries(value)) {
+        if (item === undefined) continue
+        out[key] = prune(item)
+      }
+      return out
+    }
+
+    /** Human-readable reason for each refusal the page helpers report. */
+    const REFUSAL_REASONS = {
+      'unknown-ref': 'that ref is not from the latest browser_read; read the elements again.',
+      'stale-ref': 'the element was replaced since the last read; read the elements again.',
+      'no-match': 'no element matched that selector.',
+      'invalid-selector': 'that selector is not valid CSS.',
+      'missing-target': 'pass either ref (from browser_read) or selector.',
+      'not-editable': 'that element does not accept typed text; target an input, textarea or contenteditable.',
+      'not-a-select': 'that element is not a <select>.',
+      'no-such-option': 'that option does not exist in the select.',
+    }
+
+    // -----------------------------------------------------------------------
+    // Viewport sizing
+    //
+    // The browser tab renders a <webview>, and that element's box IS the guest's
+    // viewport: a 390px-wide element makes the page lay out at 390 CSS px, so the
+    // site's own media queries take effect. To show a viewport wider than the
+    // Sidebar column we scale the element down for display only, with a CSS
+    // transform on a clipping wrapper.
+    //
+    // Deliberately NOT <webview>.setZoomFactor(): Chromium's zoom policy is
+    // same-origin, so zooming one tab would also zoom another tab showing the
+    // same site (tabs of one workspace share a storage partition). Element box +
+    // CSS transform keeps every tab independent and leaves page layout truthful.
+    // -----------------------------------------------------------------------
+
+    /** Sizes a tab's viewport can take. */
+    const VIEWPORT_PRESETS = [
+      { id: 'auto', label: '自适应', description: '跟随侧栏宽度' },
+      { id: 'phone', label: '手机', width: 390, height: 844, description: '390 × 844' },
+      { id: 'tablet', label: '平板', width: 834, height: 1112, description: '834 × 1112' },
+      { id: 'desktop', label: '电脑', width: 1280, height: 800, description: '1280 × 800' },
+      { id: 'custom', label: '自定义…', description: '指定宽高' },
+    ]
+
+    /** Accepted custom viewport bounds, in CSS pixels. */
+    const VIEWPORT_LIMITS = { minWidth: 240, maxWidth: 3840, minHeight: 320, maxHeight: 2160 }
+
+    /** Below this display scale the result is too small to read, so we warn. */
+    const MIN_COMFORTABLE_SCALE = 0.35
+
+    /** localStorage key holding per-tab viewport choices. */
+    const VIEWPORT_PERSIST = 'dsh.agent-browser.viewport.v1'
+
+    /**
+     * Clamp one numeric field to its allowed range.
+     * @param value - candidate number.
+     * @param min - inclusive lower bound.
+     * @param max - inclusive upper bound.
+     * @returns the rounded, clamped integer, or undefined when unusable.
+     */
+    function clampDimension(value, min, max) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+      const rounded = Math.round(value)
+      if (rounded < min) return min
+      if (rounded > max) return max
+      return rounded
+    }
+
+    /**
+     * Validate a custom viewport size.
+     * @param size - candidate `{ width, height }`.
+     * @returns normalized size, or a reason it was refused.
+     */
+    function normalizeViewportSize(size) {
+      if (size === null || typeof size !== 'object') return { reason: 'not-an-object' }
+      const width = clampDimension(size.width, VIEWPORT_LIMITS.minWidth, VIEWPORT_LIMITS.maxWidth)
+      const height = clampDimension(size.height, VIEWPORT_LIMITS.minHeight, VIEWPORT_LIMITS.maxHeight)
+      if (width === undefined) return { reason: 'bad-width' }
+      if (height === undefined) return { reason: 'bad-height' }
+      return { width, height }
+    }
+
+    /**
+     * Resolve a stored selection into a concrete size request.
+     * @param selection - `{ preset, custom }` from the store.
+     * @returns `{ preset, width?, height? }`; width/height absent means "follow the column".
+     */
+    function resolveViewport(selection) {
+      const preset = selection?.preset ?? 'auto'
+      if (preset === 'auto') return { preset: 'auto' }
+      if (preset === 'custom') {
+        const custom = normalizeViewportSize(selection?.custom)
+        if (custom.reason !== undefined) {
+          return { preset: 'phone', width: 390, height: 844, fellBack: custom.reason }
+        }
+        return { preset: 'custom', width: custom.width, height: custom.height }
+      }
+      const found = VIEWPORT_PRESETS.find((entry) => entry.id === preset)
+      if (found === undefined || found.width === undefined) return { preset: 'auto' }
+      return { preset: found.id, width: found.width, height: found.height }
+    }
+
+    /**
+     * Display scale that fits a target width into the available column.
+     * @param targetWidth - the viewport width in CSS pixels.
+     * @param availableWidth - the column's usable width in CSS pixels.
+     * @returns a scale in (0, 1]; 1 means no shrink.
+     */
+    function computeScale(targetWidth, availableWidth) {
+      if (!Number.isFinite(targetWidth) || targetWidth <= 0) return 1
+      if (!Number.isFinite(availableWidth) || availableWidth <= 0) return 1
+      if (availableWidth >= targetWidth) return 1
+      return availableWidth / targetWidth
+    }
+
+    /**
+     * Where to draw a scaled viewport inside the column.
+     *
+     * The page is centred rather than pinned to the top-left corner, which is
+     * what "show me this at phone size" should look like. Centring is applied as
+     * a translation *before* the scale in the CSS transform list
+     * (`translate(...) scale(...)`), so the offsets are in unscaled column pixels
+     * while the box itself is scaled about its top-left corner.
+     *
+     * Height is centred only when the scaled page actually fits. A tall preset
+     * (say 390×844 in a shorter column) would otherwise be clipped at both ends,
+     * hiding the top of the page; anchoring it to the top keeps the readable
+     * start of the document visible.
+     * @param targetWidth - the viewport width in CSS pixels.
+     * @param targetHeight - the viewport height in CSS pixels.
+     * @param availableWidth - the column's width in CSS pixels.
+     * @param availableHeight - the column's height in CSS pixels.
+     * @returns the scale, the scaled size, and the offsets to apply.
+     */
+    function computePlacement(targetWidth, targetHeight, availableWidth, availableHeight) {
+      const scale = computeScale(targetWidth, availableWidth)
+      const scaledWidth = targetWidth * scale
+      const scaledHeight = targetHeight * scale
+      const offsetX = Math.max(0, (availableWidth - scaledWidth) / 2)
+      const fitsVertically =
+        Number.isFinite(availableHeight) && availableHeight > 0 && scaledHeight <= availableHeight
+      const offsetY = fitsVertically ? Math.max(0, (availableHeight - scaledHeight) / 2) : 0
+      return { scale, scaledWidth, scaledHeight, offsetX, offsetY, verticallyCentered: fitsVertically }
+    }
+
+    /**
+     * Remove any flex-centring left on a container by an earlier build.
+     *
+     * Centring is applied through the guest's transform, so flex centring on the
+     * container would double-count and shove the page sideways. Clearing these on
+     * every apply means an already-styled container is corrected in place rather
+     * than needing a fresh page load.
+     * @param container - the element wrapping the guest.
+     */
+    function clearCenteringStyles(container) {
+      container.style.display = ''
+      container.style.alignItems = ''
+      container.style.justifyContent = ''
+    }
+
+    /**
+     * The live store/controller pair, held in module scope.
+     *
+     * The menu component reads these from closure rather than from injected
+     * props. That is deliberate: a prop that arrives `undefined` makes the
+     * component throw during render, and a thrown slot entry disappears
+     * silently — the menu simply shows the kit's own items and nothing else,
+     * which is impossible to diagnose from the UI. One client half per page
+     * means one runtime, so closure state is both correct and unbreakable.
+     */
+    let viewportRuntime
+
+    /** Per-tab viewport choices, persisted so they survive a restart. */
+    const viewportStore = defineStore({
+      init: () => ({
+        byTab: {},
+        custom: { width: 390, height: 844 },
+        lastPreset: 'auto',
+      }),
+      persist: VIEWPORT_PERSIST,
+      actions: {
+        set: (draft, tabId, preset) => {
+          draft.byTab[tabId] = { preset }
+          draft.lastPreset = preset
+        },
+        setCustom: (draft, size) => {
+          draft.custom = { width: size.width, height: size.height }
+        },
+        /** Set the preset new tabs inherit, without touching any open tab. */
+        setDefault: (draft, preset) => {
+          draft.lastPreset = preset
+        },
+        forget: (draft, tabId) => {
+          if (Object.hasOwn(draft.byTab, tabId)) delete draft.byTab[tabId]
+        },
+      },
+    })
+
+    /**
+     * Apply one tab's viewport choice to its guest element.
+     *
+     * Styling happens on the guest and on its existing parent container — the
+     * builtin's own `viewport` element — rather than on a wrapper we insert.
+     * That matters: the builtin's presentation calls `host.append(element)`
+     * whenever it re-presents a guest, which would move the element straight
+     * back out of any wrapper we added. Inline styles we set are not React-managed
+     * props (the component sets className, never style), so React leaves them be.
+     */
+    class ViewportController {
+      /**
+       * @param store - the viewport preference store instance.
+       */
+      constructor(store) {
+        this.store = store
+        /** tabId -> { guest, container, observer, frame } */
+        this.applied = new Map()
+      }
+
+      /**
+       * Locate one tab's guest element.
+       * @param sessionId - owning Session.
+       * @param tabId - target tab.
+       * @returns the webview, or undefined when it is not mounted.
+       */
+      findGuest(sessionId, tabId) {
+        const escape = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape : (value) => value
+        const root = document.querySelector(`[data-sidebar-right-session="${escape(sessionId)}"]`)
+        if (root === null) return undefined
+        for (const wrapper of root.querySelectorAll('[data-sidebar-right-tab]')) {
+          if (wrapper.dataset.sidebarRightTab !== tabId) continue
+          const guest = wrapper.querySelector('webview[data-sidebar-browser-frame="webview"]')
+          if (guest) return guest
+        }
+        return undefined
+      }
+
+      /**
+       * Apply the current choice for one tab.
+       * @param sessionId - owning Session.
+       * @param tabId - target tab.
+       * @returns the applied state, or undefined when the guest is not mounted.
+       */
+      apply(sessionId, tabId) {
+        const guest = this.findGuest(sessionId, tabId)
+        if (guest === undefined) return undefined
+
+        const container = guest.parentElement
+        if (container === null) return undefined
+
+        const entry = this.applied.get(tabId) ?? { guest, container }
+        // A re-presented guest keeps the same container, but re-resolve anyway so
+        // a stale reference never outlives the element it points at.
+        entry.guest = guest
+        entry.container = container
+        this.applied.set(tabId, entry)
+
+        const snapshot = this.store.getSnapshot()
+        const selection = snapshot.byTab[tabId] ?? { preset: snapshot.lastPreset }
+        const target = resolveViewport({ preset: selection.preset, custom: snapshot.custom })
+
+        const available =
+          container.clientWidth ||
+          container.getBoundingClientRect().width ||
+          guest.getBoundingClientRect().width
+        const availableHeight =
+          container.clientHeight || container.getBoundingClientRect().height
+
+        if (target.preset === 'auto') {
+          container.style.overflow = ''
+          container.style.position = ''
+          clearCenteringStyles(container)
+          guest.style.cssText = ''
+          // No fixed target in auto: the page simply takes the column's width.
+          entry.frame = { preset: 'auto', scale: 1, viewportWidth: Math.round(available) || undefined }
+        } else {
+          const placement = computePlacement(target.width, target.height, available, availableHeight)
+          const { scale, offsetX, offsetY } = placement
+          // Clip inside the column so the oversized guest never widens the panel.
+          //
+          // Centring is done with the transform's translate, NOT with flexbox on
+          // the container: flex centres the element's LAYOUT box, which here is
+          // the full unscaled target (e.g. 1280px inside a 650px column), so it
+          // would push the scaled result off to one side while the translate did
+          // the same job again. One mechanism only — and any flex centring left
+          // over from an earlier build is cleared here.
+          container.style.overflow = 'hidden'
+          container.style.position = 'relative'
+          clearCenteringStyles(container)
+          // The element's box IS the page's viewport, so its height must be the
+          // real target height: dividing by the scale would stretch the viewport
+          // (a "1280×800" preset would lay out at 1571px tall) and quietly break
+          // `100vh` and any height-driven layout.
+          //
+          // `translate` comes BEFORE `scale` in the list, so the offsets are in
+          // unscaled column pixels and the scale still happens about the
+          // element's top-left corner.
+          const translate =
+            offsetX > 0.5 || offsetY > 0.5
+              ? `translate(${offsetX.toFixed(2)}px, ${offsetY.toFixed(2)}px) `
+              : ''
+          guest.style.cssText = [
+            'flex:none',
+            `width:${target.width}px`,
+            `height:${target.height}px`,
+            'min-width:0',
+            'min-height:0',
+            `transform:${translate}scale(${scale})`,
+            'transform-origin:top left',
+          ].join(';')
+          entry.frame = {
+            preset: target.preset,
+            scale,
+            viewportWidth: target.width,
+            viewportHeight: target.height,
+            fellBack: target.fellBack,
+            offsetX: Math.round(offsetX),
+            offsetY: Math.round(offsetY),
+            verticallyCentered: placement.verticallyCentered,
+          }
+        }
+
+        if (entry.observer === undefined && typeof ResizeObserver === 'function') {
+          entry.observer = new ResizeObserver(() => {
+            // Column resized: recompute the display scale for this tab only.
+            this.apply(sessionId, tabId)
+          })
+          entry.observer.observe(container)
+        }
+        return entry.frame
+      }
+
+      /**
+       * Apply every mounted browser tab of a Session.
+       * @param sessionId - owning Session.
+       * @param tabIds - the Session's browser tab ids.
+       */
+      applyAll(sessionId, tabIds) {
+        for (const tabId of tabIds) this.apply(sessionId, tabId)
+      }
+
+      /**
+       * Report the applied frame for one tab.
+       * @param tabId - target tab.
+       * @returns the frame, or undefined when nothing is applied.
+       */
+      frameOf(tabId) {
+        return this.applied.get(tabId)?.frame
+      }
+
+      /**
+       * Describe a tab's viewport choice and the size its page lays out at.
+       *
+       * The measured width is the guest's own `innerWidth`, which is the number
+       * the page's media queries actually see — not the scaled box we draw.
+       * @param sessionId - owning Session.
+       * @param tabId - target tab.
+       * @returns the preset, the page's CSS pixel size, and the display scale.
+       */
+      async describe(sessionId, tabId) {
+        const frame = this.apply(sessionId, tabId)
+        const guest = this.findGuest(sessionId, tabId)
+        const snapshot = this.store.getSnapshot()
+        const selection = snapshot.byTab[tabId] ?? { preset: snapshot.lastPreset }
+
+        let measured
+        if (guest !== undefined) {
+          try {
+            measured = await guest.executeJavaScript('({ w: window.innerWidth, h: window.innerHeight })', true)
+          } catch {
+            measured = undefined
+          }
+        }
+        return prune({
+          tabId,
+          preset: selection.preset ?? 'auto',
+          custom: snapshot.custom,
+          // What the page believes its viewport is.
+          pageWidth: measured?.w,
+          pageHeight: measured?.h,
+          // What we draw: the unscaled target and the shrink we applied.
+          targetWidth: frame?.viewportWidth,
+          targetHeight: frame?.viewportHeight,
+          scale: frame?.scale,
+          mounted: guest !== undefined,
+        })
+      }
+
+      /**
+       * Change a tab's viewport preset.
+       * @param sessionId - owning Session.
+       * @param tabId - target tab.
+       * @param input - `{ preset, width?, height? }`.
+       * @returns the resulting description.
+       */
+      async select(sessionId, tabId, input) {
+        const preset = input.preset
+        const known = ['auto', 'phone', 'tablet', 'desktop', 'custom']
+        if (!known.includes(preset)) {
+          throw new Error(`unknown viewport preset "${preset}"; expected one of ${known.join(', ')}`)
+        }
+        if (preset === 'custom') {
+          const normalized = normalizeViewportSize({ width: input.width, height: input.height })
+          if (normalized.reason !== undefined) {
+            throw new Error(
+              `custom viewport needs width ${VIEWPORT_LIMITS.minWidth}-${VIEWPORT_LIMITS.maxWidth} ` +
+                `and height ${VIEWPORT_LIMITS.minHeight}-${VIEWPORT_LIMITS.maxHeight}`,
+            )
+          }
+          this.store.actions.setCustom(normalized)
+        }
+        this.store.actions.set(tabId, preset)
+        this.apply(sessionId, tabId)
+        return await this.describe(sessionId, tabId)
+      }
+
+      /** Drop observation state for a tab that closed. */
+      forget(tabId) {
+        const entry = this.applied.get(tabId)
+        entry?.observer?.disconnect()
+        this.applied.delete(tabId)
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Driver
+    // -----------------------------------------------------------------------
+
+    /** One Session's browser tabs: how to find each guest and run code in it. */
+    class BrowserDriver {
+      /** @param ctx - Client context owning the Sidebar services. */
+      constructor(ctx) {
+        this.ctx = ctx
+      }
+
+      /**
+       * Every open browser tab recorded for a Session, mounted or not.
+       * @param sessionId - owning Session.
+       * @returns tab records in Sidebar order.
+       */
+      inventory(sessionId) {
+        const openTabs = this.ctx.sidebarRight?.openTabs
+        const snapshot = openTabs?.getSnapshot?.() ?? []
+        return snapshot.filter((tab) => tab.sessionId === sessionId && tab.kind === 'browser')
+      }
+
+      /**
+       * Find the mounted `<webview>` for each browser tab of a Session.
+       *
+       * The body wrapper carries `data-sidebar-right-tab`; the title span carries
+       * it too, so each candidate is checked for an actual guest inside.
+       * @param sessionId - owning Session.
+       * @returns tabId -> webview element, for tabs currently in the DOM.
+       */
+      guests(sessionId) {
+        const found = new Map()
+        const escape = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape : (value) => value
+        const sessionRoot = document.querySelector(`[data-sidebar-right-session="${escape(sessionId)}"]`)
+        const roots = sessionRoot ? [sessionRoot] : [document]
+        for (const root of roots) {
+          for (const wrapper of root.querySelectorAll('[data-sidebar-right-tab]')) {
+            const owner = wrapper.closest('[data-sidebar-right-session]')
+            if (owner && owner.dataset.sidebarRightSession !== sessionId) continue
+            const tabId = wrapper.dataset.sidebarRightTab
+            if (!tabId || found.has(tabId)) continue
+            const guest = wrapper.querySelector('webview[data-sidebar-browser-frame="webview"]')
+            if (guest) found.set(tabId, guest)
+          }
+        }
+        return found
+      }
+
+      /**
+       * Resolve the tab a call targets.
+       *
+       * An explicit tabId must exist and be mounted; otherwise a Session with
+       * exactly one mounted browser tab is used implicitly.
+       * @param sessionId - owning Session.
+       * @param tabId - caller-named tab, if any.
+       * @returns the tabId and its guest element.
+       */
+      resolve(sessionId, tabId) {
+        const guests = this.guests(sessionId)
+        const inventory = this.inventory(sessionId)
+
+        if (typeof tabId === 'string' && tabId !== '') {
+          const guest = guests.get(tabId)
+          if (guest) return { tabId, guest }
+          const known = inventory.some((tab) => tab.tabId === tabId)
+          throw new Error(
+            known
+              ? `browser tab "${tabId}" is open but not mounted in the page, so it cannot be driven. ` +
+                'Click that tab in the right Sidebar once to mount it, then retry.'
+              : `no browser tab "${tabId}" in this Session. Call browser_tabs to list them.`,
+          )
+        }
+
+        if (guests.size === 1) {
+          const [only] = guests.entries()
+          return { tabId: only[0], guest: only[1] }
+        }
+        if (guests.size === 0) {
+          throw new Error(
+            inventory.length > 0
+              ? 'Browser tabs are open but none is mounted; click one in the right Sidebar, then retry.'
+              : 'No browser tab is open. Open one from the right Sidebar guide, or call browser_navigate.',
+          )
+        }
+        throw new Error(
+          `this Session has ${guests.size} mounted browser tabs, so tabId is required. ` +
+            'Call browser_tabs to choose one.',
+        )
+      }
+
+      /**
+       * Run a page-side helper inside a guest.
+       * @param guest - the webview element.
+       * @param helper - one of the page-side functions.
+       * @param args - JSON-serializable arguments.
+       * @returns the helper's JSON result.
+       */
+      async run(guest, helper, args = []) {
+        try {
+          return await guest.executeJavaScript(pageCall(helper, args), true)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          throw new Error(`the page refused to run the requested operation: ${message}`)
+        }
+      }
+
+      /**
+       * Wait until a guest has finished loading, or the budget runs out.
+       * @param guest - the webview element.
+       * @param timeoutMs - maximum wait.
+       */
+      async settle(guest, timeoutMs) {
+        const deadline = Date.now() + timeoutMs
+        while (Date.now() < deadline) {
+          let loading = false
+          try {
+            loading = guest.isLoading()
+          } catch {
+            return
+          }
+          if (!loading) return
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+      }
+
+      /**
+       * Describe a guest's current navigation state.
+       *
+       * Electron's own observations stay authoritative for the address and title
+       * because a guest mid-navigation can refuse script.
+       * @param guest - the webview element.
+       * @returns url, title and loading.
+       */
+      async describe(guest) {
+        let identity = { url: '', title: '' }
+        try {
+          identity = await this.run(guest, pageIdentity)
+        } catch {
+          // keep the Electron-observed values below
+        }
+        let loading = false
+        try {
+          loading = guest.isLoading()
+        } catch {
+          loading = false
+        }
+        let url = identity.url
+        try {
+          if (guest.getURL()) url = guest.getURL()
+        } catch {
+          // keep the page-reported url
+        }
+        let title = identity.title
+        try {
+          const observed = guest.getTitle()
+          if (observed) title = observed
+        } catch {
+          // keep the page-reported title
+        }
+        return { url: url || '', title: title || '', loading }
+      }
+
+      /**
+       * List the Session's browser tabs, marking which are mounted.
+       * @param sessionId - owning Session.
+       * @returns the tab list.
+       */
+      async listTabs(sessionId) {
+        const guests = this.guests(sessionId)
+        const inventory = this.inventory(sessionId)
+        const tabs = []
+        for (const record of inventory) {
+          const guest = guests.get(record.tabId)
+          let title = ''
+          let url = ''
+          let loading = false
+          if (guest) {
+            const described = await this.describe(guest)
+            title = described.title
+            url = described.url
+            loading = described.loading
+          }
+          tabs.push({
+            tabId: record.tabId,
+            title,
+            url,
+            loading,
+            mounted: guest !== undefined,
+            active: guest !== undefined,
+          })
+        }
+        return { tabs }
+      }
+
+      /**
+       * Read a tab's content.
+       * @param sessionId - owning Session.
+       * @param input - mode, tabId and character budget.
+       * @returns the read result.
+       */
+      async read(sessionId, input) {
+        const mode = input.mode ?? 'text'
+        const maxChars = Number.isFinite(input.maxChars) ? input.maxChars : 20_000
+        const { tabId, guest } = this.resolve(sessionId, input.tabId)
+        await this.settle(guest, 5_000)
+
+        const base = await this.describe(guest)
+        if (mode === 'elements') {
+          const result = await this.run(guest, pageReadElements, [MAX_ELEMENTS])
+          return prune({
+            tabId,
+            url: base.url || result.url,
+            title: base.title || result.title,
+            loading: base.loading,
+            elements: result.elements,
+            truncated: result.truncated,
+          })
+        }
+        if (mode === 'html') {
+          const result = await this.run(guest, pageReadHtml, [maxChars])
+          return prune({
+            tabId,
+            url: base.url || result.url,
+            title: base.title || result.title,
+            loading: base.loading,
+            html: result.html,
+            truncated: result.truncated,
+          })
+        }
+        const result = await this.run(guest, pageReadText, [maxChars])
+        return prune({
+          tabId,
+          url: base.url || result.url,
+          title: base.title || result.title,
+          loading: base.loading,
+          text: result.text,
+          truncated: result.truncated,
+        })
+      }
+
+      /**
+       * Perform one interaction on a tab.
+       * @param sessionId - owning Session.
+       * @param input - action and its arguments.
+       * @returns the outcome plus the tab's resulting state.
+       */
+      async act(sessionId, input) {
+        const { tabId, guest } = this.resolve(sessionId, input.tabId)
+        const ref = typeof input.ref === 'string' && input.ref !== '' ? input.ref : null
+        const selector = typeof input.selector === 'string' && input.selector !== '' ? input.selector : null
+        const action = input.action
+
+        if (action === 'wait') {
+          const requested = Number.isFinite(input.timeoutMs) ? input.timeoutMs : 1_000
+          // Never outwait the caller's own deadline.
+          const waitMs = Math.max(0, Math.min(requested, NAVIGATE_SETTLE_MS))
+          await new Promise((resolve) => setTimeout(resolve, waitMs))
+          await this.settle(guest, waitMs)
+          return prune({ tabId, action, ok: true, ...(await this.describe(guest)) })
+        }
+
+        let outcome
+        if (action === 'click') {
+          outcome = await this.run(guest, pageClick, [ref, selector])
+        } else if (action === 'type') {
+          outcome = await this.run(guest, pageType, [ref, selector, input.text ?? ''])
+        } else if (action === 'press') {
+          outcome = await this.run(guest, pagePress, [ref, selector, input.key ?? 'Enter'])
+        } else if (action === 'scroll') {
+          outcome = await this.run(guest, pageScroll, [
+            ref,
+            selector,
+            Number.isFinite(input.deltaX) ? input.deltaX : 0,
+            Number.isFinite(input.deltaY) ? input.deltaY : 600,
+          ])
+        } else if (action === 'select') {
+          outcome = await this.run(guest, pageSelect, [ref, selector, input.text ?? ''])
+        } else {
+          throw new Error(`unknown action "${action}"`)
+        }
+
+        if (outcome && outcome.ok === false) {
+          throw new Error(REFUSAL_REASONS[outcome.reason] ?? `the page refused the action (${outcome.reason})`)
+        }
+
+        // Give the page a moment to react so the next read observes the result.
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        await this.settle(guest, 5_000)
+        return prune({ tabId, action, ...outcome, ...(await this.describe(guest)) })
+      }
+
+      /**
+       * Capture a tab's visible viewport as a PNG.
+       * @param sessionId - owning Session.
+       * @param input - tabId and maximum width.
+       * @returns base64 PNG bytes and dimensions.
+       */
+      async screenshot(sessionId, input) {
+        const { tabId, guest } = this.resolve(sessionId, input.tabId)
+        const maxWidth = Number.isFinite(input.maxWidth) ? input.maxWidth : 1568
+        await this.settle(guest, 5_000)
+
+        if (typeof guest.capturePage !== 'function') {
+          throw new Error('this carrier cannot capture the page; screenshots need the Desktop webview.')
+        }
+        let image = await guest.capturePage()
+        const original = image.getSize()
+        if (original.width > maxWidth) image = image.resize({ width: maxWidth })
+        const dataUrl = image.toDataURL()
+        const comma = dataUrl.indexOf(',')
+        if (comma < 0) throw new Error('the page produced no image data')
+        const size = image.getSize()
+        return prune({
+          tabId,
+          mediaType: 'image/png',
+          base64: dataUrl.slice(comma + 1),
+          width: size.width,
+          height: size.height,
+          ...(await this.describe(guest)),
+        })
+      }
+
+      /**
+       * Open a new browser tab, or navigate an existing one.
+       * @param sessionId - owning Session.
+       * @param input - target URL and optional tabId.
+       * @returns the resulting tab.
+       */
+      async navigate(sessionId, input) {
+        const url = input.url
+        if (typeof url !== 'string' || url === '') throw new Error('browser_navigate needs a url')
+
+        if (typeof input.tabId === 'string' && input.tabId !== '') {
+          const { tabId, guest } = this.resolve(sessionId, input.tabId)
+          await guest.loadURL(url)
+          await this.settle(guest, NAVIGATE_SETTLE_MS)
+          return prune({ tabId, ...(await this.describe(guest)) })
+        }
+
+        const before = new Set(this.inventory(sessionId).map((tab) => tab.tabId))
+        this.ctx.sidebarRight.openTab('browser', { params: { url }, revealIfOpened: false })
+        // The tab is created synchronously; allow a short window for its guest
+        // to mount, keeping the total inside the caller's deadline.
+        const deadline = Date.now() + 2_000
+        while (Date.now() < deadline) {
+          const created = this.inventory(sessionId).find((tab) => !before.has(tab.tabId))
+          if (created) {
+            const guest = this.guests(sessionId).get(created.tabId)
+            if (guest) {
+              await this.settle(guest, NAVIGATE_SETTLE_MS)
+              return prune({ tabId: created.tabId, ...(await this.describe(guest)) })
+            }
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+        throw new Error(
+          'the browser tab was opened but has not mounted yet. It should appear in the right Sidebar shortly; call browser_tabs to confirm.',
+        )
+      }
+
+      /**
+       * Evaluate JavaScript in a tab.
+       * @param sessionId - owning Session.
+       * @param input - code and optional tabId.
+       * @returns the evaluated value.
+       */
+      async evaluate(sessionId, input) {
+        const code = input.code
+        if (typeof code !== 'string' || code.trim() === '') throw new Error('browser_eval needs code')
+        const { tabId, guest } = this.resolve(sessionId, input.tabId)
+        const result = await this.run(guest, pageEval, [code])
+        return prune({ tabId, ...result, ...(await this.describe(guest)) })
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Viewport controls
+    // -----------------------------------------------------------------------
+
+    /**
+     * Find the Session that owns a tab, from the DOM if the record does not say.
+     *
+     * The menu owner hands over a `TabRecord`, whose exact fields are not part of
+     * any shipped contract we can read, so `sessionId` is used when present and
+     * the enclosing `[data-sidebar-right-session]` is read otherwise. Both are
+     * the same value the tab body is rendered under.
+     * @param tab - the tab record the kit passed.
+     * @returns the Session id, or undefined when the tab is not in the DOM.
+     */
+    function sessionOfTab(tab) {
+      if (typeof tab?.sessionId === 'string' && tab.sessionId !== '') return tab.sessionId
+      const escape = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape : (value) => value
+      const wrapper = document.querySelector(`[data-sidebar-right-tab="${escape(tab?.id ?? '')}"]`)
+      return wrapper?.closest('[data-sidebar-right-session]')?.dataset.sidebarRightSession
+    }
+
+    /**
+     * The per-tab size menu.
+     *
+     * Every action must call `dismiss()`: the menu belongs to the docking kit,
+     * and an item that leaves it open floats it over content the action may have
+     * just replaced.
+     *
+     * The store and controller come from module scope, not from injected props.
+     * This matters more than it looks: the kit only opens a tab's menu when it
+     * has something to show (`onClose !== undefined || extras.some(g => g !== "")`),
+     * and with a single tab open the kit contributes no Close item. So if this
+     * component threw — which an `undefined` injected prop would cause — the
+     * entry would vanish and the menu would not open AT ALL, with no error
+     * anywhere the user could see. Reading one runtime that `apply` guarantees
+     * removes that failure mode.
+     * @param props - owner props `{ tab, dismiss }` plus the standard `sessionId`.
+     * @returns the menu entries, or null for a non-browser tab.
+     */
+    function ViewportMenuItems(props) {
+      const { tab, dismiss, t, sessionId } = props
+      // Never destructure the runtime unconditionally: if `apply` somehow has not
+      // run yet, throwing here would remove the tab menu altogether (see the note
+      // on `viewportRuntime`), so an unset runtime simply renders nothing.
+      const runtime = viewportRuntime
+      if (runtime === undefined) return null
+      const { store: viewportStore, controller: viewportController, sync: viewportSync } = runtime
+      // Subscribe to the store directly rather than declaring `store` on the
+      // registration: a store handle can only be mounted under ONE slot scope,
+      // and this plugin needs the same state in a session-scoped slot (the tab
+      // menu) and a root-scoped one (Settings). The whole-state snapshot is
+      // identity-stable, so this does not re-render in a loop.
+      const snapshot = React.useSyncExternalStore(
+        viewportStore.subscribe,
+        viewportStore.getSnapshot,
+        viewportStore.getSnapshot,
+      )
+      const current = snapshot.byTab[tab?.id]?.preset ?? snapshot.lastPreset
+      const custom = snapshot.custom
+      const [customOpen, setCustomOpen] = React.useState(false)
+
+      // Offer the control for a browser tab. `kind` is the documented field, but
+      // it is checked permissively: if the record ever lacks it (the layout's tab
+      // shape is not a contract this plugin can read), falling back to "does the
+      // tab have a guest webview in the DOM" keeps the control working. Being
+      // wrong here means the menu silently never opens, which is far worse than
+      // offering the control on a tab that turns out not to be a browser.
+      const kind = tab?.kind
+      const owner = sessionId ?? sessionOfTab(tab)
+      const hasGuest =
+        owner !== undefined &&
+        tab?.id !== undefined &&
+        viewportController.findGuest(owner, tab.id) !== undefined
+      if (kind !== undefined && kind !== 'browser') return null
+      if (kind === undefined && !hasGuest) return null
+
+      const choose = (preset) => {
+        viewportStore.actions.set(tab.id, preset)
+        // `sessionId` is a standard slot prop here; fall back to the DOM only if
+        // a future shell stops providing it.
+        const owner = sessionId ?? sessionOfTab(tab)
+        if (owner !== undefined) viewportController.apply(owner, tab.id)
+        viewportSync?.(owner)
+        dismiss()
+      }
+
+      // NOTE: `jsx(type, props, key)` — the third argument is the React KEY, not
+      // children. Passing the label there compiles fine and renders an empty
+      // button, which is exactly the bug this used to have. Children always go
+      // in `props.children`.
+      const items = VIEWPORT_PRESETS.filter((preset) => preset.id !== 'custom').map((preset) =>
+        jsx(primitives.MenuItemButton, {
+          key: preset.id,
+          icon: current === preset.id ? jsx(primitives.IconCheckOutlineRegular, {}) : undefined,
+          onSelect: () => choose(preset.id),
+          children:
+            preset.id === 'auto'
+              ? t('viewport.auto')
+              : `${t(`viewport.${preset.id}`)} · ${preset.description}`,
+        }),
+      )
+
+      items.push(
+        jsx(primitives.MenuItemButton, {
+          key: 'custom',
+          separatorBefore: true,
+          icon: current === 'custom' ? jsx(primitives.IconCheckOutlineRegular, {}) : undefined,
+          onSelect: () => {
+            setCustomOpen(true)
+          },
+          children: t('viewport.custom'),
+        }),
+      )
+
+      // At a wide preset in a narrow column the page is scaled right down, which
+      // can look like a rendering fault. Say so, with the real percentage, so the
+      // shrink reads as intentional. It joins the group as a disabled row so the
+      // menu surface only ever sees MenuGroup children.
+      const applied = viewportController.frameOf(tab.id)
+      if (applied !== undefined && applied.scale > 0 && applied.scale < MIN_COMFORTABLE_SCALE) {
+        items.push(
+          jsx(primitives.MenuItemButton, {
+            key: 'scale-note',
+            disabled: true,
+            onSelect: () => {},
+            children: t('viewport.scaleNote', { percent: Math.round(applied.scale * 100) }),
+          }),
+        )
+      }
+
+      return jsxs(React.Fragment, {
+        children: [
+          jsx(primitives.MenuGroup, { label: t('viewport.title'), children: items }),
+          // The form sits after the group so it never looks like a preset, but it
+          // stays inside the menu element — which is what keeps the kit's
+          // outside-pointerdown dismiss from tearing it down mid-typing.
+          customOpen
+            ? jsx(ViewportCustomForm, {
+                t,
+                initial: custom,
+                onClose: () => {
+                  setCustomOpen(false)
+                },
+                onApply: (size) => {
+                  viewportStore.actions.setCustom(size)
+                  viewportStore.actions.set(tab.id, 'custom')
+                  const owner = sessionId ?? sessionOfTab(tab)
+                  if (owner !== undefined) viewportController.apply(owner, tab.id)
+                  viewportSync?.(owner)
+                  setCustomOpen(false)
+                  dismiss()
+                },
+              })
+            : null,
+        ],
+      })
+    }
+
+    /**
+     * The custom-size form.
+     *
+     * Rendered INSIDE the tab menu rather than as a `Modal`. That is deliberate:
+     * the docking kit's menu closes on any `pointerdown` outside its own
+     * element, and `Modal` portals to `document.body`, so a portaled dialog
+     * would dismiss the menu — and therefore itself — the instant it was
+     * clicked. Staying inside the menu keeps every click "inside" and the form
+     * alive. `stopPropagation` is belt-and-braces for the same reason.
+     * @param props - `{ t, initial, onApply, onClose }`.
+     * @returns the inline form.
+     */
+    function ViewportCustomForm(props) {
+      const { t, initial, onApply, onClose } = props
+      const [width, setWidth] = React.useState(String(initial.width))
+      const [height, setHeight] = React.useState(String(initial.height))
+
+      const numeric = { width: Number(width), height: Number(height) }
+      const valid =
+        Number.isFinite(numeric.width) &&
+        Number.isFinite(numeric.height) &&
+        numeric.width >= VIEWPORT_LIMITS.minWidth &&
+        numeric.width <= VIEWPORT_LIMITS.maxWidth &&
+        numeric.height >= VIEWPORT_LIMITS.minHeight &&
+        numeric.height <= VIEWPORT_LIMITS.maxHeight
+
+      const message = t('viewport.invalid', {
+        min: `${VIEWPORT_LIMITS.minWidth}×${VIEWPORT_LIMITS.minHeight}`,
+        max: `${VIEWPORT_LIMITS.maxWidth}×${VIEWPORT_LIMITS.maxHeight}`,
+      })
+
+      const field = (label, value, setValue) =>
+        jsxs('label', {
+          style: { display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 0 },
+          children: [
+            jsx('span', { style: { font: 'var(--dsw-font-xxs-12)' }, children: label }),
+            jsx(primitives.Input, {
+              value,
+              inputMode: 'numeric',
+              onChange: (event) => setValue(event.currentTarget.value),
+            }),
+          ],
+        })
+
+      return jsxs('div', {
+        // Keep every click inside the menu, so its outside-pointerdown
+        // dismiss listener never fires while the user is typing.
+        onPointerDown: (event) => event.stopPropagation(),
+        onClick: (event) => event.stopPropagation(),
+        style: { display: 'flex', flexDirection: 'column', gap: 8, padding: '6px 8px 8px', minWidth: 210 },
+        children: [
+          jsx('span', {
+            style: { font: 'var(--dsw-font-xxs-12)', color: 'var(--dsw-alias-label-secondary)' },
+            children: t('viewport.customTitle'),
+          }),
+          jsxs('div', {
+            style: { display: 'flex', gap: 8 },
+            children: [
+              field(t('viewport.width'), width, setWidth),
+              field(t('viewport.height'), height, setHeight),
+            ],
+          }),
+          valid
+            ? null
+            : jsx('span', {
+                style: { color: 'var(--dsw-alias-state-error-primary)', font: 'var(--dsw-font-xxs-12)' },
+                children: message,
+              }),
+          jsxs('div', {
+            style: { display: 'flex', gap: 8, justifyContent: 'flex-end' },
+            children: [
+              jsx(primitives.Button, {
+                variant: 'secondary',
+                size: 'sm',
+                onClick: onClose,
+                children: t('viewport.cancel'),
+              }),
+              jsx(primitives.Button, {
+                variant: 'primary',
+                size: 'sm',
+                disabled: !valid,
+                onClick: () => onApply({ width: Math.round(numeric.width), height: Math.round(numeric.height) }),
+                children: t('viewport.apply'),
+              }),
+            ],
+          }),
+        ],
+      })
+    }
+
+    /**
+     * The General-settings row for the default viewport preset.
+     *
+     * `lastPreset` is the default new tabs inherit, so this row writes it
+     * directly rather than going through a per-tab key.
+     * @param props - `{ t }`; the store comes from module scope.
+     * @returns the row.
+     */
+    function ViewportSettingsRow(props) {
+      const { t } = props
+      const runtime = viewportRuntime
+      if (runtime === undefined) return null
+      const { store: viewportStore } = runtime
+      // Same shared instance as the tab menu; see ViewportMenuItems for why this
+      // subscribes directly instead of declaring `store` on the registration.
+      const snapshot = React.useSyncExternalStore(
+        viewportStore.subscribe,
+        viewportStore.getSnapshot,
+        viewportStore.getSnapshot,
+      )
+      const options = VIEWPORT_PRESETS.filter((preset) => preset.id !== 'custom').map((preset) => ({
+        value: preset.id,
+        label: preset.id === 'auto' ? t('viewport.auto') : t(`viewport.${preset.id}`),
+      }))
+      return jsxs('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 0' },
+        children: [
+          jsx('span', { style: { font: 'var(--dsw-font-xs-13)' }, children: t('viewport.settingsLabel') }),
+          jsx(primitives.SegmentedControl, {
+            id: 'browser-viewport-default',
+            value: snapshot.lastPreset === 'custom' ? 'auto' : snapshot.lastPreset,
+            options,
+            onChange: (value) => {
+              viewportStore.actions.setDefault(value)
+            },
+            label: t('viewport.settingsLabel'),
+          }),
+          jsx('span', {
+            style: { color: 'var(--dsw-alias-label-tertiary)', font: 'var(--dsw-font-xxs-12)' },
+            children: t('viewport.settingsHint'),
+          }),
+        ],
+      })
+    }
+
+    // -----------------------------------------------------------------------
+    // Inspect provider
+    // -----------------------------------------------------------------------
+
+    /** The provider accepts any JSON result; each method documents its shape. */
+    const ANY_OUTPUT = { description: 'JSON data produced by the in-app browser driver.' }
+
+    const TAB_ID = {
+      type: 'string',
+      description:
+        'Browser tab id from browser_tabs; optional when the Session has exactly one mounted tab.',
+    }
+
+    /**
+     * Build the provider registration.
+     * @param ctx - Client context.
+     * @param viewport - the shared viewport controller.
+     * @returns the manifest and query dispatcher.
+     */
+    function buildProvider(ctx, viewport) {
+      const driver = new BrowserDriver(ctx)
+      const sessionOf = (context) => {
+        const sessionId = context?.sessionId
+        if (typeof sessionId !== 'string' || sessionId === '') {
+          throw new Error('the in-app browser needs a Session-backed Agent to know which tabs to drive')
+        }
+        return sessionId
+      }
+      return {
+        manifest: {
+          id: PROVIDER,
+          description:
+            'Drive the in-app right-Sidebar browser: list tabs, read page text and interactive elements, click, type, scroll, navigate, and capture screenshots. Desktop only.',
+          methods: [
+            {
+              name: 'listTabs',
+              description: "List this Session's browser tabs with title, url, loading state and whether each is mounted.",
+              inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+              outputSchema: ANY_OUTPUT,
+            },
+            {
+              name: 'read',
+              description: 'Read a browser tab: url, title, and visible text, interactive elements, or HTML.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  tabId: TAB_ID,
+                  mode: { type: 'string', enum: ['text', 'elements', 'html'], description: 'What to return.' },
+                  maxChars: { type: 'number', description: 'Character budget for text and html modes.' },
+                },
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
+            {
+              name: 'act',
+              description: 'Perform one interaction on a browser tab: click, type, press, scroll, select or wait.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  tabId: TAB_ID,
+                  action: {
+                    type: 'string',
+                    enum: ['click', 'type', 'press', 'scroll', 'select', 'wait'],
+                    description: 'Interaction to perform.',
+                  },
+                  ref: { type: 'string', description: 'Element ref from a browser_read elements result.' },
+                  selector: { type: 'string', description: 'CSS selector, used instead of ref.' },
+                  text: { type: 'string', description: 'Text for type, or option value for select.' },
+                  key: { type: 'string', description: 'Key name for press, such as Enter.' },
+                  deltaX: { type: 'number', description: 'Horizontal scroll pixels.' },
+                  deltaY: { type: 'number', description: 'Vertical scroll pixels.' },
+                  timeoutMs: { type: 'number', description: 'Wait budget for the wait action.' },
+                },
+                required: ['action'],
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
+            {
+              name: 'screenshot',
+              description: "Capture a browser tab's visible viewport as a PNG image.",
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  tabId: TAB_ID,
+                  maxWidth: { type: 'number', description: 'Downscale the capture to at most this width.' },
+                },
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
+            {
+              name: 'navigate',
+              description: 'Open a URL in a new browser tab, or navigate an existing one.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  url: { type: 'string', description: 'HTTP or HTTPS address to open.' },
+                  tabId: TAB_ID,
+                },
+                required: ['url'],
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
+            {
+              name: 'eval',
+              description: 'Evaluate JavaScript inside a browser tab and return the JSON-serializable result.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  code: { type: 'string', description: 'Expression or statements to evaluate in the page.' },
+                  tabId: TAB_ID,
+                },
+                required: ['code'],
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
+            {
+              name: 'getViewport',
+              description:
+                "Report a browser tab's viewport preset and the CSS pixel size its page is laying out at.",
+              inputSchema: {
+                type: 'object',
+                properties: { tabId: TAB_ID },
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
+            {
+              name: 'setViewport',
+              description:
+                "Change a browser tab's viewport preset so the page lays out at a phone, tablet or desktop width (or 'auto' to follow the Sidebar column). Use it to check how a site renders at another size.",
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  tabId: TAB_ID,
+                  preset: {
+                    type: 'string',
+                    enum: ['auto', 'phone', 'tablet', 'desktop', 'custom'],
+                    description: 'Viewport preset to apply.',
+                  },
+                  width: { type: 'number', description: "CSS pixel width, required when preset is 'custom'." },
+                  height: { type: 'number', description: "CSS pixel height, required when preset is 'custom'." },
+                },
+                required: ['preset'],
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
+          ],
+        },
+        async query(method, input, context) {
+          const sessionId = sessionOf(context)
+          const args = input ?? {}
+          if (method === 'listTabs') return await driver.listTabs(sessionId)
+          if (method === 'read') return await driver.read(sessionId, args)
+          if (method === 'act') return await driver.act(sessionId, args)
+          if (method === 'screenshot') return await driver.screenshot(sessionId, args)
+          if (method === 'navigate') return await driver.navigate(sessionId, args)
+          if (method === 'eval') return await driver.evaluate(sessionId, args)
+          if (method === 'getViewport') return viewport.describe(sessionId, args.tabId)
+          if (method === 'setViewport') {
+            // Setting a size must also work for a tab that is open but not
+            // mounted: the choice is stored and applied when it mounts. Only
+            // fall back to `resolve` when the caller named no tab at all.
+            let tabId = args.tabId
+            if (tabId === undefined || tabId === '') {
+              try {
+                tabId = driver.resolve(sessionId, undefined).tabId
+              } catch (error) {
+                const inventory = driver.inventory(sessionId)
+                if (inventory.length !== 1) throw error
+                tabId = inventory[0].tabId
+              }
+            }
+            return await viewport.select(sessionId, tabId, args)
+          }
+          throw new Error(`AgentBrowser has no method "${method}"`)
+        },
+      }
+    }
+
+    /** Required Client services: the inspect registry, the Sidebar controller, and shortcuts. */
+    const inject = ['cordisInspect', 'sidebarRight', 'slots', 'shortcuts', 'locale']
+
+    /** Locale copy for the viewport controls. */
+    const COPY = {
+      zh: {
+        'viewport.title': '视口尺寸',
+        'viewport.auto': '自适应',
+        'viewport.phone': '手机',
+        'viewport.tablet': '平板',
+        'viewport.desktop': '电脑',
+        'viewport.custom': '自定义…',
+        'viewport.customTitle': '自定义视口尺寸',
+        'viewport.width': '宽度',
+        'viewport.height': '高度',
+        'viewport.apply': '应用',
+        'viewport.cancel': '取消',
+        'viewport.invalid': '请输入 {min}–{max} 之间的整数',
+        'viewport.scaleNote': '已缩小至 {percent}% 显示',
+        'viewport.shortcut': '切换浏览器视口尺寸',
+        'viewport.noTarget': '请先聚焦浏览器标签页',
+        'viewport.settingsLabel': '浏览器视口',
+        'viewport.settingsHint': '标签页右键菜单里可随时切换',
+      },
+      en: {
+        'viewport.title': 'Viewport size',
+        'viewport.auto': 'Fit column',
+        'viewport.phone': 'Phone',
+        'viewport.tablet': 'Tablet',
+        'viewport.desktop': 'Desktop',
+        'viewport.custom': 'Custom…',
+        'viewport.customTitle': 'Custom viewport size',
+        'viewport.width': 'Width',
+        'viewport.height': 'Height',
+        'viewport.apply': 'Apply',
+        'viewport.cancel': 'Cancel',
+        'viewport.invalid': 'Enter a whole number between {min} and {max}',
+        'viewport.scaleNote': 'Shown at {percent}%',
+        'viewport.shortcut': 'Cycle browser viewport size',
+        'viewport.noTarget': 'Focus a browser tab first',
+        'viewport.settingsLabel': 'Browser viewport',
+        'viewport.settingsHint': 'Switch any time from a tab\u2019s right-click menu',
+      },
+    }
+
+    /**
+     * Register the provider, the per-tab size menu, the cycle shortcut, and the
+     * settings row over one shared store and controller.
+     * @param ctx - Client context.
+     */
+    function apply(ctx) {
+      const t = ctx.locale.bind('agentBrowser')
+      ctx.effect(() => ctx.locale.register('agentBrowser', COPY), 'dsh-agent-browser: copy')
+
+      const store = viewportStore.create()
+      const viewport = new ViewportController(store)
+
+      // Apply a stored choice as soon as a tab's guest mounts, and keep every
+      // mounted browser tab in step when the column resizes.
+      const sync = (sessionId) => {
+        const tabs = ctx.sidebarRight?.openTabs?.getSnapshot?.() ?? []
+        const ids = tabs.filter((tab) => tab.sessionId === sessionId && tab.kind === 'browser').map((tab) => tab.tabId)
+        viewport.applyAll(sessionId, ids)
+      }
+
+      // Publish the runtime the menu component reads from closure, before any
+      // seat is registered, so a render can never observe it as undefined.
+      viewportRuntime = { store, controller: viewport, sync }
+
+      ctx.effect(
+        () => ctx.cordisInspect.register(buildProvider(ctx, viewport)),
+        'dsh-agent-browser: provider',
+      )
+
+      // A restored Session mounts its tabs after this plugin loads, and a saved
+      // preset has to come back with them. Poll the open-tab snapshot briefly on
+      // startup and re-apply; `apply` is idempotent, so repeats are free.
+      //
+      // Deliberately not `openTabs.subscribe`: the tab inventory is a private
+      // implementation detail whose observable surface is not part of any
+      // contract we can read, and `getSnapshot()` is the only method every
+      // shipped caller uses. A short bounded poll keeps this robust across
+      // builds without depending on an unverified method.
+      ctx.effect(() => {
+        const openTabs = ctx.sidebarRight?.openTabs
+        if (openTabs?.getSnapshot === undefined) return () => {}
+        const applyOnce = () => {
+          const tabs = openTabs.getSnapshot() ?? []
+          for (const tab of tabs) {
+            if (tab.kind === 'browser') viewport.apply(tab.sessionId, tab.tabId)
+          }
+        }
+        applyOnce()
+        // Cover the mount that happens just after load, then stop.
+        const timers = [250, 750, 1500, 3000].map((delay) => setTimeout(applyOnce, delay))
+        return () => {
+          for (const timer of timers) clearTimeout(timer)
+        }
+      }, 'dsh-agent-browser: viewport reconcile')
+
+      ctx.effect(
+        () =>
+          ctx.slots.inject('sidebar.right.tab.menu.item', () =>
+            ctx.slots.register(
+              {
+                name: 'sidebar.right.tab.menu.item',
+                id: 'agent-browser-viewport',
+                order: 40,
+                locale: 'agentBrowser',
+              },
+              ViewportMenuItems,
+            ),
+          ),
+        'dsh-agent-browser: viewport menu',
+      )
+
+      // Ships unbound: an empty `defaults` map is required by the registry, and
+      // leaving every platform out means the chord never collides with a built-in.
+      // The README shows how to bind it from Settings → Shortcuts.
+      ctx.effect(
+        () =>
+          ctx.shortcuts.register({
+            id: 'browser.viewport.cycle',
+            label: () => t('viewport.shortcut'),
+            aliases: ['viewport', 'browser size', 'responsive'],
+            defaults: {},
+            regions: ['page', 'editable', 'terminal'],
+            modals: [],
+            resolve: ({ target: element }) => {
+              const target = ctx.sidebarRight.commandTarget(element)
+              if (target === undefined || target.tabId === undefined) {
+                return { status: 'blocked', reason: t('viewport.noTarget') }
+              }
+              return {
+                status: 'handled',
+                run: () => {
+                  const tabId = target.tabId
+                  const order = ['auto', 'phone', 'tablet', 'desktop']
+                  const snapshot = store.getSnapshot()
+                  const current = snapshot.byTab[tabId]?.preset ?? snapshot.lastPreset
+                  const next = order[(order.indexOf(current) + 1) % order.length] ?? 'auto'
+                  store.actions.set(tabId, next)
+                  viewport.apply(target.sessionId, tabId)
+                },
+              }
+            },
+          }),
+        'dsh-agent-browser: viewport shortcut',
+      )
+
+      ctx.effect(
+        () =>
+          ctx.slots.inject('settings.general.item', () =>
+            ctx.slots.register(
+              {
+                name: 'settings.general.item',
+                id: 'browser-viewport',
+                order: 18,
+                locale: 'agentBrowser',
+              },
+              ViewportSettingsRow,
+            ),
+          ),
+        'dsh-agent-browser: viewport settings',
+      )
+    }
+
+    exports.apply = apply
+    exports.inject = inject
+    exports.PROVIDER = PROVIDER
+    exports.buildProvider = buildProvider
+    /** Test seam: the pure sizing helpers, exercised by test/viewport-check.cjs. */
+    exports.__viewport = {
+      computeScale,
+      computePlacement,
+      normalizeViewportSize,
+      resolveViewport,
+      clampDimension,
+      VIEWPORT_PRESETS,
+      VIEWPORT_LIMITS,
+      ViewportController,
+      viewportStore,
+      /** Seed the module-scope runtime the menu and settings row read. */
+      setRuntime: (runtime) => {
+        viewportRuntime = runtime
+      },
+      getRuntime: () => viewportRuntime,
+    }
+    return module.exports
+  },
+})

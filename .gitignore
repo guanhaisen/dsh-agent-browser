@@ -1,0 +1,9 @@
+# Dependencies. The plugin is bundled by hand and ships no build step, but the
+# profile that links it may still materialise these here.
+node_modules/
+
+# OS and editor noise.
+.DS_Store
+Thumbs.db
+*.swp
+*~
