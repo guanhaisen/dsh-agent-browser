@@ -169,11 +169,101 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
 - **文本提取使用 `innerText`** —— 它反映的是渲染结果，因此屏幕外或虚拟化列表的内容可能缺失。需要更多内容时用 `mode: 'html'` 或 `browser_eval`。
 - **Inspect 通道的文档定位是只读**，而本插件用它承载写操作（点击、输入、导航）。目前没有任何机制强制这一点，但若未来版本加入该约束，本插件将需要自己的传输层。
 - **插件代码改动需要重启。**profile 配置受监视，因此 `config:` 改动会实时重新应用，但 loader 会保留已导入的模块；修改 `index.js` 或 `client.js` 需要下次启动才生效（`client.js` 可通过刷新页面生效）。
+- **自动选中 bundle 是安装器的行为，不是保证。**新安装的包若声明了 `dsh.bundle`，会被追加到 `dsh.profile.bundles`，这也是「一条命令就够」的原因。若未来版本不再这样做，请手工把 `"dsh-agent-browser"` 加入 `dsh.profile.bundles` 并重启。
+- **应用运行期间，CLI 无法向 profile 安装。**请改用 Plugins 页或 agent 工具，或先完全退出应用。
 
 <a id="install"></a>
 ## 安装
 
 这是一个第三方 **bundle 插件**：它从你的 DSH profile 加载，而非从 `app.asar`。已安装的应用不被修改，因此卸载是彻底的，应用更新也不会覆盖它。
+
+DSH 自带插件管理器，而本仓库是合法的 bundle，因此**一条命令就够**。不需要克隆，不需要手工改文件，不需要手工建链接。
+
+### 方式 A —— 一条命令（CLI）
+
+```bash
+dsh plugin --profile desktop add github:guanhaisen/dsh-agent-browser
+```
+
+**请先完全退出 DeepSeek Harness。**该 CLI 不会去动正在运行的应用所持有的 profile；下面两种方式则可在运行中安装。
+
+### 方式 B —— Plugins 页面（无需终端）
+
+1. 打开侧边栏的 **Plugins** 入口。
+2. 选择安装，粘贴同一个规格：`github:guanhaisen/dsh-agent-browser`。
+3. 观察 pnpm 输出，然后确认。
+
+已安装的 bundle 会出现在该页面，你也可以在这里停用、移除它们，或打开它们注册的配置页。
+
+### 方式 C —— 让 Agent 装
+
+让模型在 `desktop` profile 中安装 `github:guanhaisen/dsh-agent-browser`；它会使用 `plugin_manager` 工具。每个工具动作都需要 `danger-full-access` 或一次批准。
+
+### 钉住版本（建议用于稳定环境）
+
+上述规格跟踪 `master`。若想停在某个已发布版本：
+
+```bash
+dsh plugin --profile desktop add 'github:guanhaisen/dsh-agent-browser#v0.1.0'
+```
+
+### 安装器替你完成了什么
+
+以下都不需要你手写：
+
+- 把依赖写入 `<dsh-home>/profiles/desktop/package.json`；
+- **自动把该 bundle 追加到 `dsh.profile.bundles`** —— 新装的包只要声明了 `dsh.bundle`，就会被并入该列表，而正是这个列表让它真正挂载；
+- 调用应用自带的 pnpm（无需另行安装 pnpm）；
+- 并且由于桌面端组合包含 HMR，改动会**实时生效，无需重启**。
+
+如果工具没有出现，说明 bundle 未被选中：把 `"dsh-agent-browser"` 加入 `<dsh-home>/profiles/desktop/package.json` 的 `dsh.profile.bundles`，然后重启。
+
+### 按需开关工具
+
+可选 —— 默认值是安全的。在 `<dsh-home>/profiles/desktop/cordis.patch.yml` 中：
+
+```yaml
+- id: dsh-agent-browser
+  name: dsh-agent-browser
+  config:
+    enableEval: false        # 除非你想让模型在页面中执行 JS，否则保持 false
+    maxReadChars: 20000
+    screenshotMaxWidth: 1568
+```
+
+如果需要较大的截图，也请提高 Inspect 超时，因为较慢的页面可能超过默认的 10 秒：
+
+```yaml
+- id: cordis-host-runner
+  name: '@deepseek-ai/dsh-cordis-host-runner'
+  config:
+    clientInspectTimeoutMs: 60000
+```
+
+`config:` 改动会实时重新应用；修改插件自身的 `index.js` 则需要重启。
+
+### 控件出现的位置
+
+- 模型获得六个工具（`enableEval: true` 时七个）。
+- **右键点击浏览器 tab**，可看到*视口尺寸*（自适应 / 手机 / 平板 / 电脑 / 自定义）。
+- **设置 → 通用 → 浏览器视口**设置新 tab 的默认值。
+- `browser.viewport.cycle` 已注册但**默认不绑定按键**；想要键盘快捷键请到*设置 → 快捷键*绑定。
+
+让模型调用 `browser_tabs` 即可验证 —— 它应列出你在右侧 Sidebar 打开的 tab。
+
+### 卸载
+
+使用 Plugins 页面的移除操作，或：
+
+```bash
+dsh plugin --profile desktop remove dsh-agent-browser
+```
+
+两者都会移除依赖与 `bundles` 条目。若想保留安装但停用，把该 bundle 关掉（或只删除 `bundles` 条目）并重启。`app.asar` 未被触碰，因此内置浏览器回到与出厂完全一致的行为。
+
+### 手工安装（兜底）
+
+仅当上述方式不可用时才用 —— 网络无法访问 GitHub、机器上没有 pnpm，或者你要改插件源码（本地 link 让你的改动无需重新发布即可生效）。
 
 1. **克隆到一个固定位置**（不要放在应用安装目录内）：
 
@@ -201,7 +291,7 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
 
    两部分都必需：`link:` 依赖让包可被解析，`bundles` 条目才真正挂载它。
 
-3. **让 Node 能解析到该包。**可以运行你 profile 的包管理器；如果不想触发网络请求，也可以手工建立链接：
+3. **让 Node 能解析到该包。**可以运行你 profile 的包管理器，也可以手工建立链接：
 
    ```powershell
    # Windows，无需管理员权限
@@ -216,40 +306,9 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
          ~/.dsh/profiles/desktop/node_modules/dsh-agent-browser
    ```
 
-4. **按需启用工具**，在 `<dsh-home>/profiles/desktop/cordis.patch.yml` 中（可选 —— 默认值是安全的）：
+4. **重启应用。**
 
-   ```yaml
-   - id: dsh-agent-browser
-     name: dsh-agent-browser
-     config:
-       enableEval: false        # 除非你想让模型在页面中执行 JS，否则保持 false
-       maxReadChars: 20000
-       screenshotMaxWidth: 1568
-   ```
-
-   如果需要较大的截图，也请提高 Inspect 超时，因为较慢的页面可能超过默认的 10 秒：
-
-   ```yaml
-   - id: cordis-host-runner
-     name: '@deepseek-ai/dsh-cordis-host-runner'
-     config:
-       clientInspectTimeoutMs: 60000
-   ```
-
-5. **重启应用。**新的 loader 行只在启动时读取。
-
-重启后，让模型调用 `browser_tabs` —— 如果它返回了你在右侧 Sidebar 打开的 tab，插件就已生效。
-
-### 控件出现的位置
-
-- 模型获得六个工具（`enableEval: true` 时七个）。
-- **右键点击浏览器 tab**，可看到*视口尺寸*（自适应 / 手机 / 平板 / 电脑 / 自定义）。
-- **设置 → 通用 → 浏览器视口**设置新 tab 的默认值。
-- `browser.viewport.cycle` 已注册但**默认不绑定按键**；想要键盘快捷键请到*设置 → 快捷键*绑定。
-
-### 回滚
-
-从 `dsh.profile.bundles` 中移除 `dsh-agent-browser` 条目，删除 `node_modules/dsh-agent-browser` 链接，然后重启。`app.asar` 未被触碰，因此内置浏览器回到与出厂完全一致的行为。若想保留插件但临时停用，只删除 `bundles` 条目即可。
+不要对同一个包同时使用手工 link 与安装器：管理器会尝试替换该链接，pnpm 在 Windows 上可能报 `EPERM: rename` 失败。二选一。
 
 ### 环境要求
 

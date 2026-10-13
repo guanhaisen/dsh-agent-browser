@@ -1,0 +1,13 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- A browser window: chrome bar, and a page laid out for the viewport
+       switcher this plugin adds. Drawn to match the product's own artwork
+       (36x36 grid, 2px strokes, #539CFA accent). -->
+  <rect x="6" y="7.5" width="24" height="21" rx="3" stroke="#539CFA" stroke-width="2" />
+  <path d="M6 13.5H30" stroke="#539CFA" stroke-width="2" />
+  <circle cx="9.5" cy="10.5" r="1" fill="#539CFA" />
+  <circle cx="13" cy="10.5" r="1" fill="#539CFA" />
+  <circle cx="16.5" cy="10.5" r="1" fill="#539CFA" />
+  <!-- The guest page, narrower than the frame: the phone-viewport case. -->
+  <rect x="12.5" y="16.5" width="11" height="9" rx="1.5" stroke="#539CFA" stroke-width="2" />
+  <path d="M15.5 19.5H20.5M15.5 22.5H18.5" stroke="#539CFA" stroke-width="1.6" stroke-linecap="round" />
+</svg>

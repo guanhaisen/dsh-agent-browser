@@ -26,7 +26,7 @@ browser_viewport { preset: "phone" }      -> re-render at 390×844
 > **Third-party, non-invasive plugin.** It mounts from your DSH profile, never
 > touches `app.asar`, and leaves the built-in browser exactly as shipped.
 
-- [Install](#install) — clone, wire into your profile, restart
+- [Install](#install) — one command, or the Plugins page
 - [Tools](#tools) — what the model can call
 - [Viewport sizes](#viewport-sizes-phone--desktop--custom) — the UI side
 - [Known limitations](#known-limitations) — read before filing an issue
@@ -284,12 +284,128 @@ injection. Treat tool output as data to reason about, never as instructions.
   `config:` change re-applies live, but the loader keeps the module it already
   imported; editing `index.js` or `client.js` takes effect on the next launch
   (a page refresh picks up `client.js`).
+- **Automatic bundle selection is the installer's behaviour, not a guarantee.**
+  A newly installed package that declares `dsh.bundle` is appended to
+  `dsh.profile.bundles`, which is why one command is enough. If a future release
+  stops doing that, add `"dsh-agent-browser"` to `dsh.profile.bundles` by hand and
+  restart.
+- **The CLI cannot install into a profile while the app runs.** Use the Plugins
+  page or the agent tool instead, or quit the application first.
 
 ## Install
 
 This is a third-party **bundle plugin**: it is loaded from your DSH profile, not
 from `app.asar`. Nothing in the installed application is modified, so an
 uninstall is exact and an app update cannot clobber it.
+
+DSH ships a plugin manager, and this repository is a valid bundle, so one command
+is enough. No cloning, no editing files by hand, no manual links.
+
+### Option A — one command (CLI)
+
+```bash
+dsh plugin --profile desktop add github:guanhaisen/dsh-agent-browser
+```
+
+**Fully quit DeepSeek Harness first.** The CLI refuses to touch a profile the
+running application owns; the other two options work while it runs.
+
+### Option B — the Plugins page (no terminal)
+
+1. Open the sidebar's **Plugins** entry.
+2. Choose install, and paste the same spec: `github:guanhaisen/dsh-agent-browser`.
+3. Watch pnpm's output, then confirm.
+
+Installed bundles appear on that page, where you can also switch them off, remove
+them, and open any configuration page they register.
+
+### Option C — ask the agent
+
+Tell the model to install `github:guanhaisen/dsh-agent-browser` in the `desktop`
+profile; it uses the `plugin_manager` tool. Every tool action needs
+`danger-full-access` or an approval.
+
+### Pin a version (recommended for a stable setup)
+
+The specs above track `master`. To stay on a released version:
+
+```bash
+dsh plugin --profile desktop add 'github:guanhaisen/dsh-agent-browser#v0.1.0'
+```
+
+### What the installer does for you
+
+You do not have to write any of this by hand:
+
+- adds the dependency to `<dsh-home>/profiles/desktop/package.json`,
+- **appends the bundle to `dsh.profile.bundles` automatically** — a freshly
+  installed package that declares `dsh.bundle` is reconciled into the list,
+  which is what actually mounts it,
+- runs the bundled pnpm (no separate pnpm install needed),
+- and, because the Desktop composition includes HMR, **applies the change
+  live** — no restart.
+
+If the tools do not appear, the bundle was not selected: add
+`"dsh-agent-browser"` to `dsh.profile.bundles` in
+`<dsh-home>/profiles/desktop/package.json` and restart.
+
+### Turning tools on or off
+
+Optional — the defaults are safe. In
+`<dsh-home>/profiles/desktop/cordis.patch.yml`:
+
+```yaml
+- id: dsh-agent-browser
+  name: dsh-agent-browser
+  config:
+    enableEval: false        # leave false unless you want the model to run JS in pages
+    maxReadChars: 20000
+    screenshotMaxWidth: 1568
+```
+
+Raise the Inspect timeout if you take large screenshots, since a slow page can
+exceed the 10 s default:
+
+```yaml
+- id: cordis-host-runner
+  name: '@deepseek-ai/dsh-cordis-host-runner'
+  config:
+    clientInspectTimeoutMs: 60000
+```
+
+A `config:` change re-applies live; editing the plugin's own `index.js` needs a
+restart.
+
+### Where the controls appear
+
+- The model gains six tools (seven with `enableEval: true`).
+- **Right-click a browser tab** for *Viewport size* (fit / phone / tablet /
+  desktop / custom).
+- **Settings → General → Browser viewport** sets the default for new tabs.
+- `browser.viewport.cycle` is registered but **ships unbound**; bind it in
+  *Settings → Shortcuts* if you want a keyboard shortcut.
+
+Verify it worked by asking the model to call `browser_tabs` — it should list the
+tabs open in the right Sidebar.
+
+### Uninstall
+
+Use the Plugins page's remove action, or:
+
+```bash
+dsh plugin --profile desktop remove dsh-agent-browser
+```
+
+Either drops the dependency and the `bundles` entry. To keep it installed but
+inactive, switch the bundle off (or delete only the `bundles` entry) and restart.
+Nothing in `app.asar` is touched, so the built-in browser returns to exactly its
+shipped behavior.
+
+### Manual install (fallback)
+
+Use this only when the above is unavailable — a network that cannot reach
+GitHub, a machine without pnpm, or hacking on the plugin itself, where a local
+link means your edits take effect without republishing.
 
 1. **Clone it somewhere permanent** (not inside the app install):
 
@@ -321,8 +437,7 @@ uninstall is exact and an app update cannot clobber it.
    and the `bundles` entry is what actually mounts it.
 
 3. **Make the package resolvable to Node.** Either run your profile's package
-   manager, or — if that pulls from the network you would rather avoid — create
-   the link by hand:
+   manager, or create the link by hand:
 
    ```powershell
    # Windows, from an elevated shell is NOT required
@@ -337,48 +452,11 @@ uninstall is exact and an app update cannot clobber it.
          ~/.dsh/profiles/desktop/node_modules/dsh-agent-browser
    ```
 
-4. **Enable the tools you want** in `<dsh-home>/profiles/desktop/cordis.patch.yml`
-   (optional — the defaults are safe):
+4. **Restart the application.**
 
-   ```yaml
-   - id: dsh-agent-browser
-     name: dsh-agent-browser
-     config:
-       enableEval: false        # leave false unless you want the model to run JS in pages
-       maxReadChars: 20000
-       screenshotMaxWidth: 1568
-   ```
-
-   Also raise the Inspect timeout if you take large screenshots, since a slow
-   page can exceed the 10 s default:
-
-   ```yaml
-   - id: cordis-host-runner
-     name: '@deepseek-ai/dsh-cordis-host-runner'
-     config:
-       clientInspectTimeoutMs: 60000
-   ```
-
-5. **Restart the application.** A new loader row is only read at startup.
-
-After restarting, ask the model to call `browser_tabs` — if it returns the tabs
-you have open in the right Sidebar, the plugin is live.
-
-### Where the controls appear
-
-- The model gains six tools (seven with `enableEval: true`).
-- **Right-click a browser tab** for *Viewport size* (fit / phone / tablet /
-  desktop / custom).
-- **Settings → General → Browser viewport** sets the default for new tabs.
-- `browser.viewport.cycle` is registered but **ships unbound**; bind it in
-  *Settings → Shortcuts* if you want a keyboard shortcut.
-
-### Rollback
-
-Remove the `dsh-agent-browser` entry from `dsh.profile.bundles`, delete the
-`node_modules/dsh-agent-browser` link, and restart. Nothing in `app.asar` is
-touched, so the built-in browser returns to exactly its shipped behavior. To keep
-the plugin but disable it temporarily, delete only the `bundles` entry.
+Do not combine the manual link with an installer run for the same package: the
+manager would try to replace the link and pnpm can fail with
+`EPERM: rename` on Windows. Pick one route.
 
 ### Requirements
 
@@ -391,6 +469,7 @@ the plugin but disable it temporarily, delete only the `bundles` entry.
   `[data-sidebar-right-*]` DOM attributes), so it should survive patch updates —
   but see *Known limitations* for what happens if a contract moves.
 - **Node 20+** to run the test suite.
+
 
 ## Tests
 

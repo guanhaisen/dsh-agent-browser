@@ -4,16 +4,19 @@
   "private": true,
   "type": "module",
   "description": "Agent-driven control of the DSH right-Sidebar browser: read page content, act on it, size the viewport, and take screenshots from model tools (Desktop only)",
+  "icon": "./icon.svg",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./icon.svg": "./icon.svg"
   },
   "files": [
     "index.js",
     "client.js",
     "cordis.patch.yml",
+    "icon.svg",
     "README.md",
     "README.zh.md",
     "LICENSE"
@@ -22,9 +25,13 @@
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
-    "browser",
-    "agent",
-    "tools"
+    "cordis",
+    "ai-agents",
+    "deepseek",
+    "browser-automation",
+    "agent-tools",
+    "electron",
+    "viewport"
   ],
   "repository": {
     "type": "git",
