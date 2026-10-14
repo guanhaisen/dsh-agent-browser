@@ -163,6 +163,8 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
 
 两种载体都会被识别。内置实现给桌面端 guest 打上 `<webview data-sidebar-browser-frame="webview">`，给 Web guest 打上 `<iframe data-sidebar-browser-frame="iframe">`；driver 匹配二者，并把找到的哪一种作为 `carrier` 报告。只有 webview 可驱动，因此 iframe 情况会被指名拒绝，而不会被报告成 tab 缺失。
 
+打开 tab 时**始终以「发起调用的那个 Session」为地址**，绝不以「屏幕上显示的那个」为地址。`sidebarRight.openTab` 从 `sidebarRight.mounted` 解析 Session，因此用它会把新 tab 开在当前可见的那个对话里，而不是发起调用的那个。当两个对话各自驱动自己项目的 dev server 时，tab 会落进另一个对话的侧边栏，那个对话的 agent 随后在自己的清单里发现它，并去驱动属于另一个项目的页面；而发起调用的 agent 一直在轮询自己的清单，永远看不到这个 tab，于是报出误导性的「尚未挂载」。因此本插件改用 `openTabIn(sessionId, …)`；当屏幕上的 Session 不是调用方时，宁可拒绝也不回退到 on-screen 入口。若 tab 仍然出现在别的对话里，错误信息会点名那个对话，而不是把它说成仅仅是「未挂载」。`test/session-scope-check.cjs` 守护这一点。
+
 视口尺寸复用同一条发现路径，但仅适用于 webview 载体：预设会写到 guest 自身的盒子上，而 iframe 并不向宿主渲染进程暴露该盒子。尺寸调节不新增自己的 DOM：只在 guest 及其既有的父容器上设置内联样式，因为内置呈现层在每次重新呈现时会重新 append 该元素，任何由本插件插入的 wrapper 都会被立刻移出。内置组件只设置 `className`、从不设置 `style`，因此 React 不会动这些内联样式。guest 已离开文档的 tab，其状态会在重新应用时被清理，因此已关闭的 tab 既不会让 `ResizeObserver` 继续存活，也不会报告过期的缩放比。
 
 控件位于公开的加法式座位 —— `sidebar.right.tab.menu.item` 与 `settings.general.item` —— 而非替换任何东西，因此内置浏览器保持原样工作，禁用插件时整个特性完全消失。
@@ -183,6 +185,7 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
 ## 已知限制
 - **仅限桌面端**，如上所述。
 - **仅限已挂载的 tab。**已打开但尚未挂载的 tab 无法驱动；工具会说明这一点，并请你先点击该 tab 一次。（实际上 tab 一经打开或恢复就会挂载。）设置视口是例外：它会被保存，并在 tab 挂载时应用。
+- **打开新 tab 需要该对话的侧边栏已经存在。**对于侧边栏 store 从未被 adopt 的 Session，按 Session 寻址的 open 是静默 no-op，因此在从未显示过右侧边栏的对话里，不带 `tabId` 的 `browser_navigate` 可能以「未创建」失败。先打开该对话的侧边栏一次再重试。导航已有 tab 不受影响。
 - **`shortcuts.register` 必须提供 `defaults`。**遗漏它会在 `apply()` 期间抛错，从而让整个 client 半身（含 Inspect provider）失效，且只表现为 `web boot: … did not activate`。本插件提供 `defaults: {}`；`test/apply-check.cjs` 守护这个形状，使该故障无法静默重现。
 - **菜单项从标准 slot prop 读取 `sessionId`。**仅当未来的 shell 不再提供它时，才回退到外层的 `[data-sidebar-right-session]`，因此两条路径下控件都可用。
 - **tab 菜单是右键菜单，不是“⋯”按钮。**kit 的 tab 栏没有溢出按钮；菜单由 tab 的 `onContextMenu` 处理器打开。自定义尺寸表单刻意**未使用** `Modal`：kit 会在其元素之外的任何 `pointerdown` 时关闭菜单，而 `Modal` 会 portal 到 `document.body`，因此 portal 出来的对话框会在首次点击时自我销毁。该表单改为内联渲染，并拦截指针事件。
@@ -347,7 +350,7 @@ dsh plugin --profile desktop remove dsh-agent-browser
 
 ## 测试
 
-八个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
+九个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
 
 ```bash
 node test/run-all.cjs
@@ -377,10 +380,11 @@ node test/run-all.cjs --offline
 | `apply-check` | `apply()` 激活与座位注册 —— 这一项失败意味着整个 client 半身失效。 |
 | `viewport-controller-check` | 哪个元素获得哪些内联样式、居中、回退、未挂载的 tab。 |
 | `contract-check` | 每个工具的**真实**结果形状 —— 成功与降级 —— 经过注册表自身的 lossless-JSON detach 与输出 schema 校验，外加 `truncated` 标志语义与活动 tab 报告。 |
+| `session-scope-check` | 打开 tab 时以**发起调用的** Session 为地址，而不是屏幕上显示的那个；以及落进别的对话的 tab 会被如实点名，而不是被说成仅仅「未挂载」。 |
 
 其中三个必须在打包后的可执行文件里以 Node 模式运行，因为它们从 `app.asar` 导入真实校验器；`run-all.cjs` 会替你处理。
 
-若干断言的存在，是因为曾经出过只在运行时才可见的 bug：遗漏 `shortcuts.register` 的 defaults 会静默让整个 client 半身失效；`jsx(type, props, key)` 把标签当作 React key 会渲染出空白按钮；`Modal` portal 到 kit 的点击穿透边界之外会让菜单自我关闭；视口高度被拉伸会破坏 `100vh`。
+若干断言的存在，是因为曾经出过只在运行时才可见的 bug：遗漏 `shortcuts.register` 的 defaults 会静默让整个 client 半身失效；`jsx(type, props, key)` 把标签当作 React key 会渲染出空白按钮；`Modal` portal 到 kit 的点击穿透边界之外会让菜单自我关闭；视口高度被拉伸会破坏 `100vh`；以及新 tab 走 on-screen 入口打开，结果落进另一个对话，让那个对话的 agent 去驱动了错误项目的页面。
 
 `contract-check` 出于同样的原因存在。绿色的 `schema-check` 完全不能证明某个结果真的能被返回：`browser_viewport` 的读取遗漏了它自己输出 schema 所要求的 `tabId`，而 `browser_screenshot` 的两条兜底路径都输出了 `base64: undefined`，而注册表的 lossless-JSON detach 会直接拒绝后者 —— 于是一个文档中写明可用的读取调用、以及每一次优雅的截图降级，都会在运行时抛错。该套件现在把每个工具的真实结果送入注册表的两个阶段，并直接驱动 Host 的截图分支，使其形状无法漂移。
 

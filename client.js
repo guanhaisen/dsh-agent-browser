@@ -1332,6 +1332,87 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * Open a browser tab in a named Session.
+       *
+       * `sidebarRight.openTab` is the ON-SCREEN entry: it resolves its Session
+       * from `sidebarRight.mounted` and places the tab there, ignoring who asked.
+       * A tool call belongs to the Agent's own Session, which is routinely not
+       * the one on screen — two Conversations each driving their own project's
+       * dev server is the ordinary case. Using the on-screen entry therefore put
+       * the new tab in the other Conversation's Sidebar, where that
+       * Conversation's Agent then found it in its own inventory and drove a page
+       * belonging to the other project, while the calling Agent polled its own
+       * inventory, never saw the tab, and timed out claiming it "has not mounted
+       * yet". `openTabIn` is the same navigation addressed to a Session, and is
+       * the only entry that cannot land in the wrong Conversation.
+       *
+       * `openTabIn` is documented as outside `ISidebarRight`, so it is
+       * feature-detected; and it is a silent no-op for a Session whose store was
+       * never adopted, which the caller's poll — not this method — reports.
+       * @param sessionId - owning Session.
+       * @param options - navigation parameters and placement.
+       */
+      openBrowserTab(sessionId, options) {
+        const sidebar = this.ctx.sidebarRight
+        if (sidebar === undefined) {
+          throw new Error(
+            'the in-app browser needs the right Sidebar service, which is not mounted in this composition',
+          )
+        }
+        if (typeof sidebar.openTabIn === 'function') {
+          sidebar.openTabIn(sessionId, 'browser', options)
+          return
+        }
+        // Without the Session-addressed entry, the on-screen one is only safe
+        // when the on-screen Session IS this one. Otherwise it would place the
+        // tab in another Conversation, which is strictly worse than failing.
+        const onScreen = sidebar.mounted?.getSnapshot?.()
+        if (onScreen === sessionId) {
+          sidebar.openTab('browser', options)
+          return
+        }
+        throw new Error(
+          'this Session cannot open a browser tab: the right Sidebar exposes no Session-addressed ' +
+            'open, and the on-screen Session is not this one, so opening would place the tab in ' +
+            'another Conversation. Open this Conversation so its Sidebar is on screen, then retry.',
+        )
+      }
+
+      /**
+       * Explain why a just-requested tab never became drivable in this Session.
+       *
+       * The causes need different fixes, and one message covering all of them
+       * named none: the tab may have gone to another Conversation (the leak this
+       * method exists to make visible), it may have been created here but not
+       * mounted, or it may never have been created at all because this
+       * Conversation's Sidebar has no surface yet.
+       * @param sessionId - owning Session.
+       * @param before - every `sessionId\0tabId` open before the request.
+       * @returns the message to throw.
+       */
+      missingTabReason(sessionId, before) {
+        const all = this.ctx.sidebarRight?.openTabs?.getSnapshot?.() ?? []
+        const added = all.filter((tab) => !before.has(`${tab.sessionId}\u0000${tab.tabId}`))
+        const strayed = added.find((tab) => tab.sessionId !== sessionId)
+        if (strayed !== undefined) {
+          return (
+            `the browser tab was created in another Conversation ("${strayed.sessionId}") rather than this one, ` +
+            'so nothing in this Session was changed. Opening a tab must be addressed to the calling Session.'
+          )
+        }
+        if (added.length > 0) {
+          return (
+            'the browser tab was opened but has not mounted yet. It should appear in the right Sidebar shortly; ' +
+            'call browser_tabs to confirm.'
+          )
+        }
+        return (
+          'the browser tab was not created: this Conversation has no right-Sidebar surface yet, so the Sidebar ' +
+          'had nothing to place it in. Open this Conversation\u2019s right Sidebar once, then retry.'
+        )
+      }
+
+      /**
        * Open a new browser tab, or navigate an existing one.
        * @param sessionId - owning Session.
        * @param input - target URL and optional tabId.
@@ -1351,7 +1432,14 @@ window.__ModuleLoader__.load({
         }
 
         const before = new Set(this.inventory(sessionId).map((tab) => tab.tabId))
-        this.ctx.sidebarRight.openTab('browser', { params: { url }, revealIfOpened: false })
+        // Every open across every Session, so the failure below can tell "went
+        // to the wrong Conversation" apart from "was never created here".
+        const beforeKeys = new Set(
+          (this.ctx.sidebarRight?.openTabs?.getSnapshot?.() ?? []).map(
+            (tab) => `${tab.sessionId}\u0000${tab.tabId}`,
+          ),
+        )
+        this.openBrowserTab(sessionId, { params: { url }, revealIfOpened: false })
         // The tab is created synchronously; poll for its guest to mount, sharing
         // the one call budget so mounting plus settling cannot exceed it.
         while (budgetLeft(deadline) > 0) {
@@ -1366,9 +1454,7 @@ window.__ModuleLoader__.load({
           }
           await new Promise((resolve) => setTimeout(resolve, Math.min(100, budgetLeft(deadline))))
         }
-        throw new Error(
-          'the browser tab was opened but has not mounted yet. It should appear in the right Sidebar shortly; call browser_tabs to confirm.',
-        )
+        throw new Error(this.missingTabReason(sessionId, beforeKeys))
       }
 
       /**

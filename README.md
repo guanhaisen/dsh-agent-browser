@@ -245,6 +245,19 @@ Both carriers are recognized. The built-in tags a Desktop guest
 reports which one it found as `carrier`. Only the webview is drivable, so the
 iframe case is refused by name instead of being reported as a missing tab.
 
+Opening a tab is **addressed to the calling Session**, never to the one on
+screen. `sidebarRight.openTab` resolves its Session from `sidebarRight.mounted`,
+so using it put a new tab in whichever Conversation was visible — not the one
+that asked. With two Conversations each driving their own project's dev server,
+the tab landed in the other Conversation's Sidebar, whose Agent then found it in
+its own inventory and drove a page belonging to the other project, while the
+calling Agent polled its own inventory and reported the misleading "has not
+mounted yet". The plugin therefore uses `openTabIn(sessionId, …)`, and refuses
+rather than falling back to the on-screen entry when the on-screen Session is
+not the caller's. A tab that nevertheless appears in another Conversation is
+named in the error instead of being reported as merely unmounted.
+`test/session-scope-check.cjs` guards this.
+
 Viewport sizing rides the same discovery path, but only for the webview carrier:
 a preset is written to the guest's own box, which an iframe does not expose to
 the host renderer. Sizing adds no DOM of its own: it sets
@@ -296,6 +309,11 @@ injection. Treat tool output as data to reason about, never as instructions.
   driven; the tool says so and asks you to click that tab once. (In practice
   tabs mount as soon as they are opened or restored.) Setting a viewport is the
   exception: it is stored and applied when the tab mounts.
+- **Opening a tab needs this Conversation's Sidebar to have a surface.** The
+  Session-addressed open is a silent no-op for a Session whose Sidebar store has
+  never been adopted, so `browser_navigate` without a `tabId` can fail with "not
+  created" in a Conversation that has never shown its right Sidebar. Open that
+  Conversation's Sidebar once and retry. Navigating an existing tab is unaffected.
 - **`shortcuts.register` requires a `defaults` map.** Omitting it throws during
   `apply()`, which takes down the entire client half — the Inspect provider
   included — and surfaces only as `web boot: … did not activate`. This plugin
@@ -545,7 +563,7 @@ manager would try to replace the link and pnpm can fail with
 
 ## Tests
 
-Eight suites, no test framework — plain Node scripts that exit non-zero on
+Nine suites, no test framework — plain Node scripts that exit non-zero on
 failure. The executable is located automatically (a sibling install, or
 `DeepSeek Harness.exe` somewhere up the tree); normally you do not pass it.
 
@@ -580,6 +598,7 @@ node test/run-all.cjs --offline
 | `apply-check` | `apply()` activation and seat registration — if this fails, the whole client half is down. |
 | `viewport-controller-check` | Which element gets which inline style, centring, fallbacks, unmounted tabs. |
 | `contract-check` | Every tool's **real** result shape — success and degradation — through the registry's own lossless-JSON detach and output-schema validation, plus the `truncated` flag's semantics and active-tab reporting. |
+| `session-scope-check` | That opening a tab is addressed to the **calling** Session, not the on-screen one, and that a tab landing in another Conversation is reported as such rather than as merely unmounted. |
 
 Three of these must run under the packaged executable in Node mode, because they
 import the real validators out of `app.asar`; `run-all.cjs` does that for you.
@@ -588,8 +607,10 @@ Several assertions exist because a bug shipped once and was only visible at
 runtime: a missing `shortcuts.register` defaults map that silently took the
 entire client half down, `jsx(type, props, key)` labels passed as the React key
 rendering blank buttons, a menu that dismissed itself because `Modal` portals
-outside the kit's click-through boundary, and a viewport height that stretched
-the page and broke `100vh`.
+outside the kit's click-through boundary, a viewport height that stretched the
+page and broke `100vh`, and a new tab opened through the on-screen entry, which
+put it in another Conversation and let that Conversation's Agent drive the wrong
+project's page.
 
 `contract-check` exists for the same reason. A green `schema-check` proved
 nothing about whether a result could actually be returned: `browser_viewport`'s
