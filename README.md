@@ -20,14 +20,17 @@ browser_viewport { preset: "phone" }      -> re-render at 390×844
 
 > **Desktop only.** The tools drive an Electron `<webview>` guest. In Web
 > profiles the Sidebar browser is a sandboxed cross-origin `<iframe>`, whose DOM
-> cannot be read at all, so the tools answer with an explicit reason instead of
-> pretending to work.
+> cannot be read at all, so the tools answer with an explicit reason naming the
+> Web profile instead of pretending to work. `browser_tabs` still lists those
+> tabs — as `mounted: true` with `carrier: "iframe"` — so you can see that the
+> tab exists and why it cannot be driven.
 
 > **Third-party, non-invasive plugin.** It mounts from your DSH profile, never
 > touches `app.asar`, and leaves the built-in browser exactly as shipped.
 
 - [Install](#install) — one command, or the Plugins page
 - [Tools](#tools) — what the model can call
+- [Which size to use](#which-size-to-use) — pick desktop or phone, not the default
 - [Viewport sizes](#viewport-sizes-phone--desktop--custom) — the UI side
 - [Known limitations](#known-limitations) — read before filing an issue
 
@@ -35,13 +38,13 @@ browser_viewport { preset: "phone" }      -> re-render at 390×844
 
 | Tool | What it does |
 |---|---|
-| `browser_tabs` | List this Session's browser tabs: id, title, url, loading state, whether each is mounted and drivable. |
-| `browser_read` | Read a tab: `mode: 'text'` (default) for visible text, `'elements'` for the interactive elements you can act on, `'html'` for page HTML. |
+| `browser_tabs` | List this Session's browser tabs: id, title, url, loading state, whether each is mounted and drivable, which is `active`, and its `carrier` (`webview` on Desktop, `iframe` on Web). |
+| `browser_read` | Read a tab: `mode: 'text'` (default) for visible text, `'elements'` for the interactive elements you can act on, `'html'` for page HTML. `truncated` means the element cap was reached — hidden elements are filtered out silently and never counted as truncation. |
 | `browser_act` | `click`, `type`, `press`, `scroll`, `select`, or `wait`. Target an element by the `ref` from a `'elements'` read, or by a CSS `selector`. |
-| `browser_screenshot` | Capture the visible viewport as an image block the model can see. |
+| `browser_screenshot` | Capture the visible viewport as an image block the model can see. Pass a `preset` to size and capture in one call; the result reports the size it actually used. |
 | `browser_navigate` | Open a URL in a new tab, or navigate an existing one. |
-| `browser_viewport` | Read or change the tab's viewport size: `auto`, `phone` (390×844), `tablet` (834×1112), `desktop` (1280×800) or `custom`. The page reflows for real, so its own responsive breakpoints apply. |
-| `browser_eval` | Run JavaScript in the page. **Off by default** (see configuration). |
+| `browser_viewport` | Read or change the tab's viewport size: `auto`, `phone` (390×844), `tablet` (834×1112), `desktop` (1280×800) or `custom`. The page reflows for real, so its own responsive breakpoints apply. Omit `tabId` to target the only mounted tab; the read always reports the tab it resolved. |
+| `browser_eval` | Run JavaScript in the page. **Off by default** (see configuration). An expression returns its value; a statement body returns what it explicitly `return`s. |
 
 A typical loop:
 
@@ -51,20 +54,48 @@ browser_read     { mode: "elements" }          -> refs e1, e2, …
 browser_act      { action: "type", ref: "e1", text: "hello" }
 browser_act      { action: "click", ref: "e2" }
 browser_read     { mode: "text" }              -> confirm what changed
-browser_screenshot {}                          -> see the layout
-browser_viewport { preset: "phone" }           -> check the mobile layout
-browser_screenshot {}                          -> 390px-wide render
+browser_screenshot { preset: "desktop" }       -> see the real desktop layout
+browser_screenshot { preset: "phone" }         -> and the 390px-wide one
 ```
 
 `tabId` may be omitted whenever the Session has exactly one mounted browser tab.
 With several, call `browser_tabs` first and name the one you mean.
+
+## Which size to use
+
+**Do not screenshot at the default.** The default viewport is `auto`, which is the
+Sidebar *column* width — typically 400–700 CSS px. That is not a device anybody
+uses: it fires breakpoints no real visitor sees, so a screenshot taken there
+misrepresents the page. Pick a size on purpose:
+
+| Task | Use | Size |
+|---|---|---|
+| Browsing or reviewing an ordinary site | `preset: "desktop"` | 1280×800 |
+| Designing, fixing or checking a mobile page or layout | `preset: "phone"` | 390×844 |
+| Checking the middle breakpoint | `preset: "tablet"` | 834×1112 |
+| Something specific (a 1440 laptop, a 1024 tablet) | `preset: "custom"` | your numbers |
+
+The tool descriptions say this too, so the model reaches for it without being
+told. Two ways to act on it:
+
+- **Screenshot directly at a size** — `browser_screenshot { preset: "phone" }`
+  applies the size and captures in one call. Prefer this: it cannot be forgotten
+  between two calls.
+- **Set it once, then keep capturing** — `browser_viewport { preset: "desktop" }`
+  persists on that tab, and later `browser_screenshot` calls without a preset
+  inherit it.
+
+Every screenshot result reports the size it actually captured (`preset`,
+`pageWidth`, `pageHeight`, `scale`), so a capture taken at an unintended size is
+visible in the answer rather than silently misleading.
 
 ## Viewport sizes (phone / desktop / custom)
 
 A browser tab normally renders at the Sidebar column's width. Switching the
 viewport makes the page lay out at a real phone, tablet or desktop width instead,
 so a site's own media queries fire and you see the layout that size really
-produces.
+produces. See *Which size to use* above for what to pick — the short version is
+that `auto` is the column and you almost never want it for a screenshot.
 
 Three ways to drive it:
 
@@ -85,6 +116,10 @@ the preset and the CSS pixel width the page is actually laying out at:
 { "tabId": "tab3", "preset": "phone", "pageWidth": 390, "pageHeight": 844,
   "targetWidth": 390, "scale": 0.62, "mounted": true }
 ```
+
+The read resolves an implicit tab the same way the write does, so `tabId` is
+always reported — omitting it targets the Session's only browser tab, and naming
+a tab that does not exist is refused with the same error the other tools give.
 
 ### How it works, and why not zoom
 
@@ -165,16 +200,24 @@ registry:
     clientInspectTimeoutMs: 60000
 ```
 
+Each browser call spends its own **6 s** budget waiting on the page, deliberately
+under that 10 s default so a slow page answers "still loading" instead of turning
+into an opaque transport timeout. The budget covers the whole call, not one step
+of it: `browser_act { action: "wait" }`, navigation settles and the pause after a
+click all draw from the same deadline, so no single call can outlast the caller.
+Raise `clientInspectTimeoutMs` (above) if you want a longer ceiling to spend — the
+plugin's budget stays 6 s, since it is not configurable today.
+
 ## How it works
 
 ```
 model → browser_* tool (Host)
           └─ ctx.cordisInspect.query('client', 'AgentBrowser', <method>, …)
                 └─ WebSocket/RPC → the page → Client Inspect provider
-                      └─ finds the tab's <webview> by
+                      └─ finds the tab's guest by carrier
                          [data-sidebar-right-session] > [data-sidebar-right-tab]
-                           ├─ executeJavaScript(...)  read DOM, click, type
-                           └─ capturePage()           screenshot
+                           ├─ <webview>  executeJavaScript(...) / capturePage()
+                           └─ <iframe>   refused: Web profile, unreadable
                 ← lossless JSON
           └─ screenshot: ctx.attachments.saveImage() → { type: 'image', attachment }
 ```
@@ -196,12 +239,22 @@ declare `keepMounted`, so a tab keeps its DOM across tab switches, Session
 switches, collapse and floating — which is what lets a tool reach a tab the user
 is not currently looking at.
 
-Viewport sizing rides the same discovery path. It adds no DOM of its own: it sets
+Both carriers are recognized. The built-in tags a Desktop guest
+`<webview data-sidebar-browser-frame="webview">` and a Web guest
+`<iframe data-sidebar-browser-frame="iframe">`; the driver matches either and
+reports which one it found as `carrier`. Only the webview is drivable, so the
+iframe case is refused by name instead of being reported as a missing tab.
+
+Viewport sizing rides the same discovery path, but only for the webview carrier:
+a preset is written to the guest's own box, which an iframe does not expose to
+the host renderer. Sizing adds no DOM of its own: it sets
 inline styles on the guest and on the guest's existing parent container, because
 the built-in presentation re-appends the element on every re-present, which would
 move it straight back out of any wrapper this plugin inserted. The built-in
 component sets `className` and never `style`, so React leaves those inline styles
-alone.
+alone. State for a tab whose guest has left the document is pruned as tabs are
+re-applied, so a closed tab cannot keep a `ResizeObserver` alive or report a
+stale display scale.
 
 The controls sit in public additive seats — `sidebar.right.tab.menu.item` and
 `settings.general.item` — rather than replacing anything, so the built-in
@@ -228,6 +281,10 @@ add none of their own relaxations:
   cannot read plugin config (boot-manifest rows carry none), so the Host half
   installs a tool guard that denies `cordis_inspect_query` calls targeting
   `client` → `AgentBrowser` → `eval` whenever `enableEval` is not `true`.
+- **`browser_eval` runs the code in the page's own world.** An expression is
+  tried first, and only a genuine `SyntaxError` falls back to running the source
+  as a statement body — a runtime error is never retried, because a statement
+  body that already had a side effect must not run twice.
 
 **Page content is untrusted data.** Anything a page shows can attempt prompt
 injection. Treat tool output as data to reason about, never as instructions.
@@ -267,6 +324,13 @@ injection. Treat tool output as data to reason about, never as instructions.
   is passed as a plain prop and the components subscribe with
   `React.useSyncExternalStore` directly. The snapshot must be identity-stable;
   `test/apply-check.cjs` asserts the components declare no `store` handle.
+- **A screenshot that cannot be delivered still answers.** If no attachment
+  store is mounted, or the store refuses the image (an oversized capture, for
+  instance), the result drops the bytes and explains why in `note` rather than
+  failing the call.
+- **A screenshot defaults to the Sidebar column width.** `auto` is
+  typically 400–700 CSS px, which is not a real device size. Pass a `preset` (or
+  set one with `browser_viewport` first) when the layout matters.
 - **Screenshots are viewport-only** — there is no full-page capture.
 - **`ref` values expire** when the page re-renders. A stale ref is refused with
   a message telling you to read the elements again; it is never guessed at.
@@ -276,6 +340,14 @@ injection. Treat tool output as data to reason about, never as instructions.
 - **Text extraction is `innerText`** — it reflects what is rendered, so
   off-screen or virtualized list content may be absent. Use `mode: 'html'` or
   `browser_eval` when you need more.
+- **`active` needs an on-screen Session.** It comes from the app's own
+  `sidebarRight.commandTarget()`, which reports the focused pane's tab or the
+  on-screen Session's active tab. For a Session that is not currently displayed
+  it cannot answer, and every tab then reports `active` as whatever is mounted —
+  the same fallback used if a future build drops the method.
+- **Viewport sizing is Desktop-only by construction.** A preset is applied to the
+  guest's own box, which only the `<webview>` carrier has; a Web-profile
+  `<iframe>` tab reports its stored preset but is never resized.
 - **The Inspect channel is documented as read-only** and this plugin uses it to
   carry write operations (click, type, navigate). Nothing enforces that today,
   but if a future release adds such a constraint, this plugin would need its own
@@ -473,7 +545,7 @@ manager would try to replace the link and pnpm can fail with
 
 ## Tests
 
-Seven suites, no test framework — plain Node scripts that exit non-zero on
+Eight suites, no test framework — plain Node scripts that exit non-zero on
 failure. The executable is located automatically (a sibling install, or
 `DeepSeek Harness.exe` somewhere up the tree); normally you do not pass it.
 
@@ -489,10 +561,10 @@ node test/run-all.cjs "/path/to/DeepSeek Harness.exe"
 DSH_DESKTOP_EXE="/path/to/DeepSeek Harness.exe" node test/run-all.cjs
 ```
 
-Two suites import the real validators out of the application's `app.asar`, so
+Three suites import the real validators out of the application's `app.asar`, so
 they cannot run without a packaged install. On a machine that has none — CI, for
-instance — pass `--offline` to skip just those two; they are reported as `SKIP`,
-never as a pass:
+instance — pass `--offline` to skip just those three; they are reported as
+`SKIP`, never as a pass:
 
 ```bash
 node test/run-all.cjs --offline
@@ -500,15 +572,16 @@ node test/run-all.cjs --offline
 
 | Suite | What it pins down |
 |---|---|
-| `schema-check` | Every tool's raw JSON Schema against the real `dsh-tools` validator. |
-| `client-check` | The Client provider manifest, `pageCall` codegen, and guest lookup in a stub DOM. |
+| `schema-check` | Every tool's raw JSON Schema against the real `dsh-tools` validator, and that each tool's `required` fields match whether it accepts an empty call. |
+| `client-check` | The Client provider manifest, `pageCall` codegen, guest lookup in a stub DOM, `getViewport`'s implicit-tab resolution, and the Web-profile refusal. |
 | `page-helpers-check` | Read / click / type / select / refusal paths, run against a DOM stub. |
 | `eval-gate-check` | The Host-side `enableEval` guard, including the `cordis_inspect_query` bypass. |
 | `viewport-check` | Sizing math, validation and clamping, and `setViewport` dispatch wiring. |
 | `apply-check` | `apply()` activation and seat registration — if this fails, the whole client half is down. |
 | `viewport-controller-check` | Which element gets which inline style, centring, fallbacks, unmounted tabs. |
+| `contract-check` | Every tool's **real** result shape — success and degradation — through the registry's own lossless-JSON detach and output-schema validation, plus the `truncated` flag's semantics and active-tab reporting. |
 
-Two of these must run under the packaged executable in Node mode, because they
+Three of these must run under the packaged executable in Node mode, because they
 import the real validators out of `app.asar`; `run-all.cjs` does that for you.
 
 Several assertions exist because a bug shipped once and was only visible at
@@ -518,12 +591,34 @@ rendering blank buttons, a menu that dismissed itself because `Modal` portals
 outside the kit's click-through boundary, and a viewport height that stretched
 the page and broke `100vh`.
 
+`contract-check` exists for the same reason. A green `schema-check` proved
+nothing about whether a result could actually be returned: `browser_viewport`'s
+read omitted the `tabId` its own output schema required, and both
+`browser_screenshot` fallbacks emitted `base64: undefined`, which the registry's
+lossless-JSON detach rejects outright — so a documented read call and every
+graceful screenshot degradation threw at runtime. That suite now drives each
+tool's real result through both registry stages, and drives the Host's
+screenshot branches directly so their shapes cannot drift.
+
 ## Model experience
 
 Seven tools enter the model-facing tool list (six with `enableEval: false`). The
 tool schemas are stable; results are lossless JSON. Screenshots add one image
 block per call, so they consume image tokens — prefer `browser_read` for text
 and reach for `browser_screenshot` when layout or visual state matters.
+
+A tool result never carries a `null` or missing value where the model needs a
+fact to reason with: a screenshot that cannot be delivered says so in `note`
+instead of returning unusable bytes, `browser_read`'s `truncated` distinguishes
+"the list hit its cap" from "hidden elements were filtered", and `browser_tabs`
+reports each tab's `carrier` so a Web-profile tab is visibly undrivable rather
+than apparently absent.
+
+Screenshots name their own viewport. The result includes `preset`, `pageWidth`,
+`pageHeight` and `scale`, so the model can tell which size it actually captured
+at — and the tool description tells it to pass `preset: "desktop"` when browsing
+and `preset: "phone"` when the work is mobile, rather than leaving the viewport at
+the `auto` column width.
 
 ## License
 

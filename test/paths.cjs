@@ -56,6 +56,28 @@ function findExecutable() {
 }
 
 /**
+ * Absolute path to a module inside the packaged `app.asar`.
+ *
+ * The Electron checks import real implementations out of the installed build so
+ * their assertions cannot drift from it. An unresolvable install must be
+ * reported clearly rather than as a module error.
+ * @param segments - path segments below `app.asar/dsh/node_modules`.
+ * @returns the absolute path.
+ */
+function asarModulePath(...segments) {
+  const exe = findExecutable()
+  if (exe === undefined) {
+    throw new Error(
+      'Could not locate "DeepSeek Harness.exe", which this check needs to read real\n' +
+        'modules out of app.asar.\n' +
+        'Pass it explicitly:  node test/<check>.cjs "/path/to/DeepSeek Harness.exe"\n' +
+        'or set DSH_DESKTOP_EXE.',
+    )
+  }
+  return join(dirname(exe), 'resources', 'app.asar', 'dsh', 'node_modules', ...segments)
+}
+
+/**
  * Absolute path to `dsh-tools` inside the packaged `app.asar`.
  *
  * The Electron checks import this to reach the real schema validators, so an
@@ -63,16 +85,18 @@ function findExecutable() {
  * @returns the path to `.../app.asar/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js`.
  */
 function asarToolsPath() {
-  const exe = findExecutable()
-  if (exe === undefined) {
-    throw new Error(
-      'Could not locate "DeepSeek Harness.exe", which this check needs to read the real\n' +
-        'dsh-tools validators out of app.asar.\n' +
-        'Pass it explicitly:  node test/<check>.cjs "/path/to/DeepSeek Harness.exe"\n' +
-        'or set DSH_DESKTOP_EXE.',
-    )
-  }
-  return join(dirname(exe), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js')
+  return asarModulePath('@deepseek-ai', 'dsh-tools', 'lib', 'index.js')
+}
+
+/**
+ * Absolute path to `dsh-util-values` inside the packaged `app.asar`.
+ *
+ * This is where the registry's own `snapshotJsonValue` lives — the lossless-JSON
+ * detach every tool result passes through before output-schema validation.
+ * @returns the path to that module's entry file.
+ */
+function asarValuesPath() {
+  return asarModulePath('@deepseek-ai', 'dsh-util-values', 'lib', 'index.js')
 }
 
 /** A `file://` URL for dynamic import, with Windows separators normalised. */
@@ -80,4 +104,4 @@ function fileUrl(path) {
   return 'file:///' + path.replace(/\\/g, '/')
 }
 
-module.exports = { PLUGIN_ROOT, pluginFile, findExecutable, asarToolsPath, fileUrl }
+module.exports = { PLUGIN_ROOT, pluginFile, findExecutable, asarModulePath, asarToolsPath, asarValuesPath, fileUrl }

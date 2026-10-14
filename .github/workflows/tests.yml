@@ -1,9 +1,10 @@
 name: tests
 
-# Runs the checks that need no packaged DSH install. Two suites (schema-check and
-# client-check) import the real `dsh-tools` validators out of the application's
-# `app.asar`, which is not available in CI, so the runner is invoked with
-# `--offline` and reports those two as SKIP rather than pretending they passed.
+# Runs the checks that need no packaged DSH install. Three suites (schema-check,
+# client-check and contract-check) import the real `dsh-tools` validators out of
+# the application's `app.asar`, which is not available in CI, so the runner is
+# invoked with `--offline` and reports those three as SKIP rather than pretending
+# they passed.
 #
 # No dependencies to install: the plugin is bundled by hand and every check is a
 # plain Node script.

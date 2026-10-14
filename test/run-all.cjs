@@ -40,17 +40,17 @@ const pureChecks = [
   ['viewport controller behavior', 'viewport-controller-check.cjs'],
 ]
 
-// `--offline` is authoritative, not a fallback: it means "skip the two checks
+// `--offline` is authoritative, not a fallback: it means "skip the checks
 // that need a packaged install", whether or not one happens to be findable. That
 // keeps a CI run reproducible on a machine that also has DSH installed.
 const skipPackaged = offline || exe === undefined
 
 if (exe === undefined && !offline) {
   console.error(
-    'Could not locate "DeepSeek Harness.exe", needed by two checks that read the real\n' +
+    'Could not locate "DeepSeek Harness.exe", needed by three checks that read the real\n' +
       'dsh-tools validators out of app.asar.\n' +
       'Pass it explicitly:  node test/run-all.cjs "/path/to/DeepSeek Harness.exe"\n' +
-      'set DSH_DESKTOP_EXE, or run with --offline to skip those two checks.',
+      'set DSH_DESKTOP_EXE, or run with --offline to skip those three checks.',
   )
   process.exit(2)
 }
@@ -63,13 +63,14 @@ const electronEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_DESKTOP_EXE
 
 if (skipPackaged) {
   const reason = offline ? '--offline' : 'no packaged install found'
-  for (const label of ['tool + manifest schemas', 'client half wiring']) {
+  for (const label of ['tool + manifest schemas', 'client half wiring', 'tool result contracts']) {
     results.push({ label, ok: true, status: 'skipped' })
     process.stdout.write(`\n=== ${label} ===\nSKIPPED (${reason}: needs a packaged install)\n`)
   }
 } else {
   run('tool + manifest schemas', exe, ['--expose-internals', join(here, 'schema-check.cjs')], { env: electronEnv })
   run('client half wiring', exe, ['--expose-internals', join(here, 'client-check.cjs')], { env: electronEnv })
+  run('tool result contracts', exe, ['--expose-internals', join(here, 'contract-check.cjs')], { env: electronEnv })
 }
 
 for (const [label, file] of pureChecks) {

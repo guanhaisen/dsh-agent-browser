@@ -59,10 +59,24 @@ async function main() {
       console.error(`FAIL ${label} output: ${error.message}`)
       failures++
     }
-    // An empty object must be a valid call for every tool (required fields are
-    // enforced by the registry, and browser_tabs takes none).
+    // An empty object must be a valid call for every tool that takes no required
+    // argument, and must be REFUSED for one that does. Printing this without
+    // asserting is how a schema that could never be satisfied shipped.
     const violations = validateJsonSchemaValue(definition.parameters, {}, '')
-    console.log(`     empty-args violations: ${violations.length === 0 ? 'none' : violations.join('; ')}`)
+    const requiresSomething = Array.isArray(definition.parameters.required) && definition.parameters.required.length > 0
+    if (requiresSomething) {
+      if (violations.length === 0) {
+        console.error(`FAIL ${label}: declares required ${JSON.stringify(definition.parameters.required)} but accepts {}`)
+        failures++
+      } else {
+        console.log(`ok   ${label} refuses an empty call, as its required fields demand`)
+      }
+    } else if (violations.length > 0) {
+      console.error(`FAIL ${label}: accepts no arguments yet rejects {} — ${violations.join('; ')}`)
+      failures++
+    } else {
+      console.log(`ok   ${label} accepts an empty call`)
+    }
   }
 
   // Spot-check that a realistic call validates.

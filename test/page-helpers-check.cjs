@@ -269,6 +269,15 @@ async function main() {
   const refs = elements.elements.map((e) => e.ref)
   check('elements are numbered from e1', refs[0] === 'e1', refs)
   check('hidden element excluded by opacity', !elements.elements.some((e) => e.text === 'Hidden'), elements.elements)
+  // The stub's `hidden` button is filtered out by geometry, so exactly one
+  // candidate is dropped for visibility. That must NOT read as truncation: the
+  // flag means the element cap was reached. It used to compare every match
+  // against the kept list, which made it permanently true on real pages.
+  check(
+    'filtered-out elements are not reported as truncation',
+    elements.truncated === false,
+    { truncated: elements.truncated, returned: elements.elements.length },
+  )
   const buttonEntry = elements.elements.find((e) => e.tag === 'button')
   const inputEntry = elements.elements.find((e) => e.tag === 'input')
   check('button labelled from its text', buttonEntry?.text === 'Submit', buttonEntry)
@@ -314,6 +323,64 @@ async function main() {
     check('invalid selector rejected', false)
   } catch (error) {
     check('invalid selector rejected', /not valid CSS/.test(error.message), error.message)
+  }
+
+  // --- browser_eval: expressions AND statements -----------------------------
+  // The description promises statements, and only an expression used to work, so
+  // `const a = 1; a + 1` failed with a SyntaxError the model could do nothing
+  // about. These run the real generated source, so the fallback is exercised.
+  {
+    const expression = await provider.query('eval', { code: '1 + 1' }, { sessionId: 's1' })
+    check('eval evaluates an expression', expression.value === 2 && expression.kind === 'number', expression)
+
+    const pageRead = await provider.query('eval', { code: 'document.title' }, { sessionId: 's1' })
+    check('eval can read the page', pageRead.value === 'Test Page', pageRead)
+
+    // A statement body must RUN rather than being refused as a syntax error. Its
+    // value is undefined unless it returns explicitly, which is what the tool
+    // description now promises.
+    const statements = await provider.query('eval', { code: 'const a = 1; a + 2' }, { sessionId: 's1' })
+    check(
+      'eval runs a statement body instead of rejecting it',
+      statements.kind === 'undefined' && statements.value === null,
+      statements,
+    )
+
+    const withReturn = await provider.query(
+      'eval',
+      { code: 'const x = 4; if (x > 1) { return x * 2 }' },
+      { sessionId: 's1' },
+    )
+    check('eval honours an explicit return', withReturn.value === 8, withReturn)
+
+    const noReturn = await provider.query('eval', { code: 'const unused = 1;' }, { sessionId: 's1' })
+    check(
+      'a statement body with no return reports undefined rather than throwing',
+      noReturn.kind === 'undefined' && noReturn.value === null,
+      noReturn,
+    )
+
+    // The security-relevant property of the fallback: a RUNTIME error must not be
+    // retried as a statement body, because the expression already ran and may
+    // have had a side effect. Only a syntax error may fall back.
+    const before = await provider.query('eval', { code: 'window.__probeRuns' }, { sessionId: 's1' })
+    check('the side-effect probe starts unset', before.kind !== 'number', before)
+    try {
+      await provider.query(
+        'eval',
+        { code: "(() => { window.__probeRuns = (window.__probeRuns || 0) + 1; throw new Error('boom') })()" },
+        { sessionId: 's1' },
+      )
+      check('a runtime error surfaces instead of being retried', false, 'it resolved')
+    } catch (error) {
+      check('a runtime error surfaces instead of being retried', /boom/.test(error.message), error.message)
+    }
+    const after = await provider.query('eval', { code: 'window.__probeRuns' }, { sessionId: 's1' })
+    check(
+      'a throwing expression runs exactly once (no statement-body retry)',
+      after.value === 1,
+      after,
+    )
   }
 
   console.log(failures === 0 ? '\nALL PAGE HELPER CHECKS PASSED' : `\n${failures} FAILURES`)

@@ -54,14 +54,45 @@ window.__ModuleLoader__.load({
     const MAX_ELEMENTS = 300
 
     /**
-     * Navigation settle budget, in milliseconds.
+     * Total wall-clock budget one provider call may spend waiting on the page,
+     * in milliseconds.
      *
      * Deliberately below the Inspect channel's client-query timeout (10 s by
      * default, raisable through `cordis-host-runner.clientInspectTimeoutMs`):
      * waiting longer than the caller's deadline only turns a clean "still
      * loading" answer into an opaque transport timeout.
+     *
+     * This is a budget for the WHOLE call, not for one step of it. Every wait a
+     * call performs — settling after a navigation, sleeping for `wait`, settling
+     * again — is charged against one deadline started when the call arrived, so
+     * a single call can no longer accumulate past the caller's timeout. An
+     * earlier build capped each step at 8 s independently, which let
+     * `act { action: 'wait' }` spend 16 s and outlive a default 10 s timeout.
      */
-    const NAVIGATE_SETTLE_MS = 8_000
+    const CALL_BUDGET_MS = 6_000
+
+    /**
+     * Share of the call budget a mid-call "let the page react" pause may use.
+     * The rest is reserved for the settle and describe steps that follow it.
+     */
+    const REACTION_PAUSE_MS = 150
+
+    /**
+     * Start a per-call budget.
+     * @returns an absolute deadline in `Date.now()` terms.
+     */
+    function beginCall() {
+      return Date.now() + CALL_BUDGET_MS
+    }
+
+    /**
+     * Time left inside a call budget, never below zero.
+     * @param deadline - from {@link beginCall}.
+     * @returns milliseconds remaining.
+     */
+    function budgetLeft(deadline) {
+      return Math.max(0, deadline - Date.now())
+    }
 
     // -----------------------------------------------------------------------
     // Page-side helpers.
@@ -146,6 +177,12 @@ window.__ModuleLoader__.load({
     /**
      * Collect visible interactive elements, register each under a fresh `eN` ref,
      * and return their descriptors.
+     *
+     * `truncated` means the element CAP was reached — the list is incomplete and
+     * reading again will not help. It deliberately does not count the matches
+     * that were skipped for being invisible: almost every real page carries a
+     * hidden input or a collapsed menu, so reporting those as truncation made
+     * the flag permanently true and therefore useless.
      * @param max - element budget.
      * @returns element descriptors with the refs `act` accepts.
      */
@@ -175,11 +212,15 @@ window.__ModuleLoader__.load({
       }
 
       const out = []
+      let cut = false
       const nodes = document.querySelectorAll(
         'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[contenteditable="true"]',
       )
       for (const el of nodes) {
-        if (out.length >= max) break
+        if (out.length >= max) {
+          cut = true
+          break
+        }
         if (!visible(el)) continue
         const ref = 'e' + (out.length + 1)
         store.set(ref, el)
@@ -200,7 +241,7 @@ window.__ModuleLoader__.load({
         url: location.href,
         title: document.title || '',
         elements: out,
-        truncated: nodes.length > out.length,
+        truncated: cut,
       }
     }
 
@@ -335,11 +376,24 @@ window.__ModuleLoader__.load({
 
     /**
      * Evaluate caller-supplied JavaScript in the page.
-     * @param code - expression or statements to evaluate.
+     *
+     * An expression is tried first, so `document.title` returns its value. Only a
+     * genuine syntax error falls back to evaluating the source as a statement
+     * body — never a runtime error, because re-running a body that already had a
+     * side effect would repeat it. A statement body returns whatever it
+     * explicitly `return`s, which is `undefined` (reported as `kind: 'undefined'`)
+     * when it does not.
+     * @param code - expression, or statements to evaluate.
      * @returns the JSON-serializable value, or a description of what came back.
      */
     function pageEval(code) {
-      const value = new Function('"use strict";return (' + code + ')')()
+      let value
+      try {
+        value = new Function('"use strict";return (' + code + '\n)')()
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error
+        value = new Function('"use strict";' + code)()
+      }
       if (value === undefined) return { value: null, kind: 'undefined' }
       if (value === null) return { value: null, kind: 'null' }
       const kind = typeof value
@@ -631,6 +685,9 @@ window.__ModuleLoader__.load({
        * @returns the applied state, or undefined when the guest is not mounted.
        */
       apply(sessionId, tabId) {
+        // Cheap, and it keeps a closed tab's frame from being reported as the
+        // current display state for this one.
+        this.pruneDetached()
         const guest = this.findGuest(sessionId, tabId)
         if (guest === undefined) return undefined
 
@@ -720,11 +777,38 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * Forget tabs whose guest has left the document.
+       *
+       * `forget` is the precise path, but nothing outside this class reliably
+       * knows when a tab closes, so the map would otherwise hold a frame and a
+       * live `ResizeObserver` per tab id for the whole page lifetime. Worse, a
+       * closed tab's frame stayed readable, which let the menu quote a display
+       * scale for a tab that no longer exists.
+       *
+       * A removed guest is the observable signal available here: the built-in
+       * keeps a visited tab mounted, so a guest that is gone is a tab that is
+       * gone. `isConnected` is checked by identity (`=== false`) so a carrier
+       * that does not expose it at all is left alone rather than pruned.
+       * @returns how many entries were dropped.
+       */
+      pruneDetached() {
+        let dropped = 0
+        for (const [tabId, entry] of this.applied) {
+          if (entry.guest?.isConnected !== false) continue
+          entry.observer?.disconnect()
+          this.applied.delete(tabId)
+          dropped++
+        }
+        return dropped
+      }
+
+      /**
        * Apply every mounted browser tab of a Session.
        * @param sessionId - owning Session.
        * @param tabIds - the Session's browser tab ids.
        */
       applyAll(sessionId, tabIds) {
+        this.pruneDetached()
         for (const tabId of tabIds) this.apply(sessionId, tabId)
       }
 
@@ -817,9 +901,14 @@ window.__ModuleLoader__.load({
 
     /** One Session's browser tabs: how to find each guest and run code in it. */
     class BrowserDriver {
-      /** @param ctx - Client context owning the Sidebar services. */
-      constructor(ctx) {
+      /**
+       * @param ctx - Client context owning the Sidebar services.
+       * @param viewport - the shared viewport controller, so a screenshot can
+       *   apply a size before capturing without a second tool call.
+       */
+      constructor(ctx, viewport) {
         this.ctx = ctx
+        this.viewport = viewport
       }
 
       /**
@@ -834,12 +923,18 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Find the mounted `<webview>` for each browser tab of a Session.
+       * Find the mounted guest for each browser tab of a Session.
        *
        * The body wrapper carries `data-sidebar-right-tab`; the title span carries
        * it too, so each candidate is checked for an actual guest inside.
+       *
+       * BOTH carriers are recognized, because both are mounted by the built-in:
+       * Desktop attaches a `<webview>` and Web attaches a sandboxed
+       * cross-origin `<iframe>` (each tagged `data-sidebar-browser-frame`). A
+       * webview is drivable; an iframe is not readable at all, but finding it is
+       * what lets the tools say *that* instead of claiming the tab is unmounted.
        * @param sessionId - owning Session.
-       * @returns tabId -> webview element, for tabs currently in the DOM.
+       * @returns tabId -> `{ element, carrier }`, for tabs currently in the DOM.
        */
       guests(sessionId) {
         const found = new Map()
@@ -852,8 +947,13 @@ window.__ModuleLoader__.load({
             if (owner && owner.dataset.sidebarRightSession !== sessionId) continue
             const tabId = wrapper.dataset.sidebarRightTab
             if (!tabId || found.has(tabId)) continue
-            const guest = wrapper.querySelector('webview[data-sidebar-browser-frame="webview"]')
-            if (guest) found.set(tabId, guest)
+            const webview = wrapper.querySelector('webview[data-sidebar-browser-frame="webview"]')
+            if (webview) {
+              found.set(tabId, { element: webview, carrier: 'webview' })
+              continue
+            }
+            const iframe = wrapper.querySelector('iframe[data-sidebar-browser-frame="iframe"]')
+            if (iframe) found.set(tabId, { element: iframe, carrier: 'iframe' })
           }
         }
         return found
@@ -866,15 +966,15 @@ window.__ModuleLoader__.load({
        * exactly one mounted browser tab is used implicitly.
        * @param sessionId - owning Session.
        * @param tabId - caller-named tab, if any.
-       * @returns the tabId and its guest element.
+       * @returns `{ tabId, guest, carrier }`.
        */
       resolve(sessionId, tabId) {
         const guests = this.guests(sessionId)
         const inventory = this.inventory(sessionId)
 
         if (typeof tabId === 'string' && tabId !== '') {
-          const guest = guests.get(tabId)
-          if (guest) return { tabId, guest }
+          const entry = guests.get(tabId)
+          if (entry) return { tabId, guest: entry.element, carrier: entry.carrier }
           const known = inventory.some((tab) => tab.tabId === tabId)
           throw new Error(
             known
@@ -886,7 +986,7 @@ window.__ModuleLoader__.load({
 
         if (guests.size === 1) {
           const [only] = guests.entries()
-          return { tabId: only[0], guest: only[1] }
+          return { tabId: only[0], guest: only[1].element, carrier: only[1].carrier }
         }
         if (guests.size === 0) {
           throw new Error(
@@ -898,6 +998,26 @@ window.__ModuleLoader__.load({
         throw new Error(
           `this Session has ${guests.size} mounted browser tabs, so tabId is required. ` +
             'Call browser_tabs to choose one.',
+        )
+      }
+
+      /**
+       * Refuse an operation the calling carrier cannot support, with the real
+       * reason instead of a message about mounting.
+       *
+       * In Web profiles the right-Sidebar browser is a sandboxed cross-origin
+       * `<iframe>`: the element is found and mounted, but its document is
+       * unreachable from the host renderer, so no read, click, screenshot or
+       * script can be performed against it at all.
+       * @param carrier - `'webview'` or `'iframe'`.
+       * @param what - the operation being refused.
+       */
+      requireDrivable(carrier, what) {
+        if (carrier === 'webview') return
+        throw new Error(
+          `this Session runs in a Web profile, where the right-Sidebar browser is a sandboxed ` +
+            `cross-origin <iframe> whose document cannot be read, so it cannot ${what}. ` +
+            'Open the Desktop app to use the browser tools.',
         )
       }
 
@@ -937,6 +1057,19 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * Whether a guest is still loading, without asking the page.
+       * @param guest - the webview element.
+       * @returns Electron's observation, or false when it cannot report one.
+       */
+      isLoading(guest) {
+        try {
+          return guest.isLoading()
+        } catch {
+          return false
+        }
+      }
+
+      /**
        * Describe a guest's current navigation state.
        *
        * Electron's own observations stay authoritative for the address and title
@@ -951,12 +1084,7 @@ window.__ModuleLoader__.load({
         } catch {
           // keep the Electron-observed values below
         }
-        let loading = false
-        try {
-          loading = guest.isLoading()
-        } catch {
-          loading = false
-        }
+        const loading = this.isLoading(guest)
         let url = identity.url
         try {
           if (guest.getURL()) url = guest.getURL()
@@ -974,21 +1102,47 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * List the Session's browser tabs, marking which are mounted.
+       * The tab the app itself considers active for a Session, if it can say.
+       *
+       * `sidebarRight.commandTarget()` is the app's own answer: the focused
+       * pane's tab, or the on-screen Session's active dock pane's tab. It needs
+       * an on-screen Session, and it is not a contract this plugin can assume —
+       * so a missing or throwing implementation degrades to `undefined` and the
+       * caller falls back to "mounted" rather than failing the whole listing.
+       * @param sessionId - owning Session.
+       * @returns the active tabId, or undefined when the app cannot report one.
+       */
+      activeTabId(sessionId) {
+        try {
+          const target = this.ctx.sidebarRight?.commandTarget?.()
+          if (target === undefined || target.sessionId !== sessionId) return undefined
+          return typeof target.tabId === 'string' && target.tabId !== '' ? target.tabId : undefined
+        } catch {
+          return undefined
+        }
+      }
+
+      /**
+       * List the Session's browser tabs, marking which are mounted and which is
+       * active.
        * @param sessionId - owning Session.
        * @returns the tab list.
        */
       async listTabs(sessionId) {
         const guests = this.guests(sessionId)
         const inventory = this.inventory(sessionId)
+        const activeTabId = this.activeTabId(sessionId)
         const tabs = []
         for (const record of inventory) {
-          const guest = guests.get(record.tabId)
+          const entry = guests.get(record.tabId)
           let title = ''
           let url = ''
           let loading = false
-          if (guest) {
-            const described = await this.describe(guest)
+          // Only a webview can be asked anything; an iframe guest is mounted but
+          // unreadable, and reporting it as unmounted would be a lie the user
+          // cannot act on. `carrier` is how the model tells the two apart.
+          if (entry !== undefined && entry.carrier === 'webview') {
+            const described = await this.describe(entry.element)
             title = described.title
             url = described.url
             loading = described.loading
@@ -998,8 +1152,11 @@ window.__ModuleLoader__.load({
             title,
             url,
             loading,
-            mounted: guest !== undefined,
-            active: guest !== undefined,
+            mounted: entry !== undefined,
+            // The app's own active tab when it can report one; otherwise the
+            // best available approximation, which is "the one that is drawn".
+            active: activeTabId === undefined ? entry !== undefined : record.tabId === activeTabId,
+            ...(entry === undefined ? {} : { carrier: entry.carrier }),
           })
         }
         return { tabs }
@@ -1007,24 +1164,30 @@ window.__ModuleLoader__.load({
 
       /**
        * Read a tab's content.
+       *
+       * The page helpers already return `url` and `title` alongside the payload,
+       * so identity comes from the one call that had to happen anyway; only
+       * `loading` needs the Electron-observed state, which costs no page script.
        * @param sessionId - owning Session.
        * @param input - mode, tabId and character budget.
        * @returns the read result.
        */
       async read(sessionId, input) {
+        const deadline = beginCall()
         const mode = input.mode ?? 'text'
         const maxChars = Number.isFinite(input.maxChars) ? input.maxChars : 20_000
-        const { tabId, guest } = this.resolve(sessionId, input.tabId)
-        await this.settle(guest, 5_000)
+        const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
+        this.requireDrivable(carrier, 'be read')
+        await this.settle(guest, budgetLeft(deadline))
 
-        const base = await this.describe(guest)
+        const loading = this.isLoading(guest)
         if (mode === 'elements') {
           const result = await this.run(guest, pageReadElements, [MAX_ELEMENTS])
           return prune({
             tabId,
-            url: base.url || result.url,
-            title: base.title || result.title,
-            loading: base.loading,
+            url: result.url,
+            title: result.title,
+            loading,
             elements: result.elements,
             truncated: result.truncated,
           })
@@ -1033,9 +1196,9 @@ window.__ModuleLoader__.load({
           const result = await this.run(guest, pageReadHtml, [maxChars])
           return prune({
             tabId,
-            url: base.url || result.url,
-            title: base.title || result.title,
-            loading: base.loading,
+            url: result.url,
+            title: result.title,
+            loading,
             html: result.html,
             truncated: result.truncated,
           })
@@ -1043,9 +1206,9 @@ window.__ModuleLoader__.load({
         const result = await this.run(guest, pageReadText, [maxChars])
         return prune({
           tabId,
-          url: base.url || result.url,
-          title: base.title || result.title,
-          loading: base.loading,
+          url: result.url,
+          title: result.title,
+          loading,
           text: result.text,
           truncated: result.truncated,
         })
@@ -1058,17 +1221,22 @@ window.__ModuleLoader__.load({
        * @returns the outcome plus the tab's resulting state.
        */
       async act(sessionId, input) {
-        const { tabId, guest } = this.resolve(sessionId, input.tabId)
+        const deadline = beginCall()
+        const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
+        this.requireDrivable(carrier, 'be interacted with')
         const ref = typeof input.ref === 'string' && input.ref !== '' ? input.ref : null
         const selector = typeof input.selector === 'string' && input.selector !== '' ? input.selector : null
         const action = input.action
 
         if (action === 'wait') {
           const requested = Number.isFinite(input.timeoutMs) ? input.timeoutMs : 1_000
-          // Never outwait the caller's own deadline.
-          const waitMs = Math.max(0, Math.min(requested, NAVIGATE_SETTLE_MS))
+          // Never outwait the caller's own deadline. The sleep and the settle
+          // that follows it share ONE budget: capping each of them separately
+          // (which an earlier build did) let a single call cost twice what it
+          // promised and outlive the Inspect channel's timeout.
+          const waitMs = Math.min(Math.max(0, requested), budgetLeft(deadline))
           await new Promise((resolve) => setTimeout(resolve, waitMs))
-          await this.settle(guest, waitMs)
+          await this.settle(guest, budgetLeft(deadline))
           return prune({ tabId, action, ok: true, ...(await this.describe(guest)) })
         }
 
@@ -1097,21 +1265,43 @@ window.__ModuleLoader__.load({
         }
 
         // Give the page a moment to react so the next read observes the result.
-        await new Promise((resolve) => setTimeout(resolve, 150))
-        await this.settle(guest, 5_000)
+        await new Promise((resolve) => setTimeout(resolve, Math.min(REACTION_PAUSE_MS, budgetLeft(deadline))))
+        await this.settle(guest, budgetLeft(deadline))
         return prune({ tabId, action, ...outcome, ...(await this.describe(guest)) })
       }
 
       /**
        * Capture a tab's visible viewport as a PNG.
+       *
+       * An optional `preset` applies a viewport size first, so one call can
+       * answer "show me this page at desktop width" without a separate
+       * `setViewport` round-trip. It is worth reaching for: the default `auto`
+       * size is the Sidebar COLUMN (often 400–700 CSS px), which is not a device
+       * anybody uses and fires breakpoints no real visitor sees.
+       *
+       * The result always reports the viewport actually captured — preset, the
+       * page's own `innerWidth`/`innerHeight`, and the display scale — so a
+       * capture taken at the wrong size is visible in the answer instead of
+       * being silently misleading.
        * @param sessionId - owning Session.
-       * @param input - tabId and maximum width.
-       * @returns base64 PNG bytes and dimensions.
+       * @param input - tabId, maximum width, and an optional preset to apply.
+       * @returns base64 PNG bytes, dimensions, and the viewport used.
        */
       async screenshot(sessionId, input) {
-        const { tabId, guest } = this.resolve(sessionId, input.tabId)
+        const deadline = beginCall()
+        const tabId = resolveViewportTab(this, sessionId, input.tabId)
+        const { guest, carrier } = this.resolve(sessionId, tabId)
+        this.requireDrivable(carrier, 'be captured')
+
+        // Apply the requested size before capturing, if one was named. Only a
+        // webview can be sized, which `requireDrivable` has already established.
+        let frame
+        if (typeof input.preset === 'string' && input.preset !== '') {
+          frame = await this.viewport.select(sessionId, tabId, input)
+        }
+
         const maxWidth = Number.isFinite(input.maxWidth) ? input.maxWidth : 1568
-        await this.settle(guest, 5_000)
+        await this.settle(guest, budgetLeft(deadline))
 
         if (typeof guest.capturePage !== 'function') {
           throw new Error('this carrier cannot capture the page; screenshots need the Desktop webview.')
@@ -1130,6 +1320,14 @@ window.__ModuleLoader__.load({
           width: size.width,
           height: size.height,
           ...(await this.describe(guest)),
+          ...(frame === undefined
+            ? {}
+            : {
+                preset: frame.preset,
+                pageWidth: frame.pageWidth,
+                pageHeight: frame.pageHeight,
+                scale: frame.scale,
+              }),
         })
       }
 
@@ -1140,31 +1338,33 @@ window.__ModuleLoader__.load({
        * @returns the resulting tab.
        */
       async navigate(sessionId, input) {
+        const deadline = beginCall()
         const url = input.url
         if (typeof url !== 'string' || url === '') throw new Error('browser_navigate needs a url')
 
         if (typeof input.tabId === 'string' && input.tabId !== '') {
-          const { tabId, guest } = this.resolve(sessionId, input.tabId)
-          await guest.loadURL(url)
-          await this.settle(guest, NAVIGATE_SETTLE_MS)
-          return prune({ tabId, ...(await this.describe(guest)) })
+          const resolved = this.resolve(sessionId, input.tabId)
+          this.requireDrivable(resolved.carrier, 'be navigated')
+          await resolved.guest.loadURL(url)
+          await this.settle(resolved.guest, budgetLeft(deadline))
+          return prune({ tabId: resolved.tabId, ...(await this.describe(resolved.guest)) })
         }
 
         const before = new Set(this.inventory(sessionId).map((tab) => tab.tabId))
         this.ctx.sidebarRight.openTab('browser', { params: { url }, revealIfOpened: false })
-        // The tab is created synchronously; allow a short window for its guest
-        // to mount, keeping the total inside the caller's deadline.
-        const deadline = Date.now() + 2_000
-        while (Date.now() < deadline) {
+        // The tab is created synchronously; poll for its guest to mount, sharing
+        // the one call budget so mounting plus settling cannot exceed it.
+        while (budgetLeft(deadline) > 0) {
           const created = this.inventory(sessionId).find((tab) => !before.has(tab.tabId))
           if (created) {
-            const guest = this.guests(sessionId).get(created.tabId)
-            if (guest) {
-              await this.settle(guest, NAVIGATE_SETTLE_MS)
-              return prune({ tabId: created.tabId, ...(await this.describe(guest)) })
+            const entry = this.guests(sessionId).get(created.tabId)
+            if (entry) {
+              this.requireDrivable(entry.carrier, 'be navigated')
+              await this.settle(entry.element, budgetLeft(deadline))
+              return prune({ tabId: created.tabId, ...(await this.describe(entry.element)) })
             }
           }
-          await new Promise((resolve) => setTimeout(resolve, 100))
+          await new Promise((resolve) => setTimeout(resolve, Math.min(100, budgetLeft(deadline))))
         }
         throw new Error(
           'the browser tab was opened but has not mounted yet. It should appear in the right Sidebar shortly; call browser_tabs to confirm.',
@@ -1180,7 +1380,10 @@ window.__ModuleLoader__.load({
       async evaluate(sessionId, input) {
         const code = input.code
         if (typeof code !== 'string' || code.trim() === '') throw new Error('browser_eval needs code')
-        const { tabId, guest } = this.resolve(sessionId, input.tabId)
+        const deadline = beginCall()
+        const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
+        this.requireDrivable(carrier, 'run script')
+        await this.settle(guest, budgetLeft(deadline))
         const result = await this.run(guest, pageEval, [code])
         return prune({ tabId, ...result, ...(await this.describe(guest)) })
       }
@@ -1493,13 +1696,48 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Decide which tab a viewport read or write targets.
+     *
+     * Setting a size must also work for a tab that is open but not mounted: the
+     * choice is stored and applied when it mounts. Reading has the same
+     * requirement for a different reason — the tool's result schema requires a
+     * `tabId`, so a read that resolved no tab would fail output validation
+     * instead of answering.
+     *
+     * A named tab is validated against the inventory rather than passed through,
+     * so a typo'd id fails with the same unknown-tab error the other tools give
+     * instead of looking like a valid, empty tab. Only when the caller named no
+     * tab at all does the implicit-tab rule apply.
+     * @param driver - the Session's browser driver.
+     * @param sessionId - owning Session.
+     * @param tabId - caller-named tab, if any.
+     * @returns the resolved tabId.
+     */
+    function resolveViewportTab(driver, sessionId, tabId) {
+      const named = typeof tabId === 'string' && tabId !== ''
+      if (named) {
+        if (driver.inventory(sessionId).some((tab) => tab.tabId === tabId)) return tabId
+        throw new Error(`no browser tab "${tabId}" in this Session. Call browser_tabs to list them.`)
+      }
+      try {
+        return driver.resolve(sessionId, undefined).tabId
+      } catch (error) {
+        // No mounted guest to resolve from: an open-but-unmounted tab is still a
+        // legitimate target, so an unambiguous inventory decides.
+        const inventory = driver.inventory(sessionId)
+        if (inventory.length !== 1) throw error
+        return inventory[0].tabId
+      }
+    }
+
+    /**
      * Build the provider registration.
      * @param ctx - Client context.
      * @param viewport - the shared viewport controller.
      * @returns the manifest and query dispatcher.
      */
     function buildProvider(ctx, viewport) {
-      const driver = new BrowserDriver(ctx)
+      const driver = new BrowserDriver(ctx, viewport)
       const sessionOf = (context) => {
         const sessionId = context?.sessionId
         if (typeof sessionId !== 'string' || sessionId === '') {
@@ -1560,12 +1798,19 @@ window.__ModuleLoader__.load({
             },
             {
               name: 'screenshot',
-              description: "Capture a browser tab's visible viewport as a PNG image.",
+              description: "Capture a browser tab's visible viewport as a PNG image, optionally applying a viewport size first.",
               inputSchema: {
                 type: 'object',
                 properties: {
                   tabId: TAB_ID,
                   maxWidth: { type: 'number', description: 'Downscale the capture to at most this width.' },
+                  preset: {
+                    type: 'string',
+                    enum: ['auto', 'phone', 'tablet', 'desktop', 'custom'],
+                    description: 'Viewport size to apply before capturing, so one call can capture at a named size.',
+                  },
+                  width: { type: 'number', description: "Custom width, used with preset 'custom'." },
+                  height: { type: 'number', description: "Custom height, used with preset 'custom'." },
                 },
                 additionalProperties: false,
               },
@@ -1642,22 +1887,11 @@ window.__ModuleLoader__.load({
           if (method === 'screenshot') return await driver.screenshot(sessionId, args)
           if (method === 'navigate') return await driver.navigate(sessionId, args)
           if (method === 'eval') return await driver.evaluate(sessionId, args)
-          if (method === 'getViewport') return viewport.describe(sessionId, args.tabId)
+          if (method === 'getViewport') {
+            return await viewport.describe(sessionId, resolveViewportTab(driver, sessionId, args.tabId))
+          }
           if (method === 'setViewport') {
-            // Setting a size must also work for a tab that is open but not
-            // mounted: the choice is stored and applied when it mounts. Only
-            // fall back to `resolve` when the caller named no tab at all.
-            let tabId = args.tabId
-            if (tabId === undefined || tabId === '') {
-              try {
-                tabId = driver.resolve(sessionId, undefined).tabId
-              } catch (error) {
-                const inventory = driver.inventory(sessionId)
-                if (inventory.length !== 1) throw error
-                tabId = inventory[0].tabId
-              }
-            }
-            return await viewport.select(sessionId, tabId, args)
+            return await viewport.select(sessionId, resolveViewportTab(driver, sessionId, args.tabId), args)
           }
           throw new Error(`AgentBrowser has no method "${method}"`)
         },

@@ -13,7 +13,8 @@ const CLIENT = pluginFile('client.js')
 
 /** Minimal fake DOM sufficient for the driver's lookup logic. */
 function makeFakeDom({ sessionId, tabs }) {
-  // Each tab: { tabId, guest } where guest is null for an unmounted tab.
+  // Each tab: { tabId, guest } where guest is null for an unmounted tab, or
+  // { tabId, iframe } to stand in for a Web-profile carrier.
   const wrappers = tabs.map((tab) => {
     const wrapper = {
       dataset: { sidebarRightTab: tab.tabId },
@@ -23,6 +24,7 @@ function makeFakeDom({ sessionId, tabs }) {
       },
       querySelector(selector) {
         if (selector.includes('webview') && tab.guest) return tab.guest
+        if (selector.includes('iframe') && tab.iframe) return tab.iframe
         return null
       },
     }
@@ -255,6 +257,77 @@ async function main() {
     failures++
   } catch (error) {
     console.log('ok   Session-less query rejected:', error.message.slice(0, 60) + '…')
+  }
+
+  // --- getViewport must resolve the tab it reports --------------------------
+  // The read path used to forward an omitted tabId straight through, so the
+  // result carried no `tabId` at all and failed the tool's own output schema
+  // ("missing required property tabId"). `live` uses the real driver, so this
+  // exercises the real resolution rule.
+  {
+    const implicit = await live.query('getViewport', {}, { sessionId: 'session-1' })
+    if (implicit.tabId === 'tab-a') {
+      console.log('ok   getViewport resolves the only mounted tab when tabId is omitted')
+    } else {
+      console.error('FAIL: getViewport without tabId reported', JSON.stringify(implicit))
+      failures++
+    }
+
+    try {
+      await live.query('getViewport', { tabId: 'no-such-tab' }, { sessionId: 'session-1' })
+      console.error('FAIL: getViewport with an unknown tabId should throw')
+      failures++
+    } catch (error) {
+      if (/no browser tab "no-such-tab"/.test(error.message)) {
+        console.log('ok   getViewport rejects an unknown tabId like the other tools')
+      } else {
+        console.error('FAIL: getViewport unknown-tab error was:', error.message)
+        failures++
+      }
+    }
+  }
+
+  // --- a Web-profile iframe is mounted but must be reported honestly --------
+  // The iframe carrier cannot be read, but the tab IS mounted: claiming it is
+  // not mounted sends the user to click a tab that is already open.
+  {
+    const iframeGuest = { tagName: 'IFRAME' }
+    const iframeWrapper = {
+      dataset: { sidebarRightTab: 'tab-i' },
+      closest: () => dom.sessionRoot,
+      querySelector: (selector) => (selector.includes('iframe') ? iframeGuest : null),
+    }
+    dom.sessionRoot.querySelectorAll = (selector) =>
+      selector === '[data-sidebar-right-tab]' ? [iframeWrapper] : []
+    const webCtx = {
+      sidebarRight: {
+        openTabs: {
+          getSnapshot: () => [{ sessionId: 'session-1', tabId: 'tab-i', kind: 'browser', contentId: 'i' }],
+        },
+        openTab: () => {},
+      },
+    }
+    const webProvider = exports.buildProvider(webCtx, viewportStub)
+    const listed = await webProvider.query('listTabs', {}, { sessionId: 'session-1' })
+    const entry = listed.tabs[0]
+    if (entry?.mounted === true && entry?.carrier === 'iframe') {
+      console.log('ok   an iframe tab is reported as mounted with carrier=iframe')
+    } else {
+      console.error('FAIL: iframe tab reporting is wrong:', JSON.stringify(entry))
+      failures++
+    }
+    try {
+      await webProvider.query('read', { mode: 'text' }, { sessionId: 'session-1' })
+      console.error('FAIL: reading a Web-profile iframe should throw')
+      failures++
+    } catch (error) {
+      if (/Web profile/.test(error.message) && /iframe/.test(error.message)) {
+        console.log('ok   a Web-profile read names the Web profile and the iframe')
+      } else {
+        console.error('FAIL: Web-profile refusal was:', error.message)
+        failures++
+      }
+    }
   }
 
   console.log(failures === 0 ? '\nALL CLIENT CHECKS PASSED' : `\n${failures} FAILURES`)

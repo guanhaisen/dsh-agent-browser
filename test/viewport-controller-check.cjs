@@ -356,6 +356,40 @@ function harness({ containerWidth = 800, preset = 'auto', custom, mounted = true
   check('forget on an unknown tab is safe', controller.forget('never-seen') === undefined)
 }
 
+// --- a tab whose guest left the document is pruned -------------------------
+// Nothing outside the controller reliably reports a tab close, so without this
+// the map and one ResizeObserver per tab id lived for the whole page lifetime —
+// and `frameOf` kept answering for a tab that no longer existed, which is how the
+// menu could quote a display scale for a closed tab.
+{
+  const { dom, controller } = harness({ preset: 'desktop', containerWidth: 640, containerHeight: 700 })
+  controller.apply('s1', 'tab1')
+  check('the frame is readable while the guest is connected', controller.frameOf('tab1') !== undefined)
+  check('nothing is pruned while the guest is connected', controller.pruneDetached() === 0)
+
+  // The built-in removes the guest element from the document on close.
+  dom.guest.isConnected = false
+  check('a detached guest is pruned', controller.pruneDetached() === 1)
+  check('a pruned tab stops reporting a frame', controller.frameOf('tab1') === undefined)
+  check('pruning is idempotent', controller.pruneDetached() === 0)
+
+  // Re-applying for the same (now absent) tab must not resurrect the frame.
+  dom.guest.isConnected = true
+  controller.apply('s1', 'tab1')
+  check('a re-applied tab reports its frame again', controller.frameOf('tab1') !== undefined)
+}
+
+// --- a carrier without isConnected is left alone ---------------------------
+// The guard is `=== false` on purpose: a stub or future carrier that does not
+// expose `isConnected` must not be pruned just for being different.
+{
+  const { dom, controller } = harness({ preset: 'phone', containerWidth: 800 })
+  controller.apply('s1', 'tab1')
+  delete dom.guest.isConnected
+  check('a guest without isConnected is not pruned', controller.pruneDetached() === 0)
+  check('its frame survives', controller.frameOf('tab1') !== undefined)
+}
+
 // --- describe --------------------------------------------------------------
 async function describeChecks() {
   const { controller } = harness({ preset: 'phone', containerWidth: 800 })
