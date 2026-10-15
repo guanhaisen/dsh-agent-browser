@@ -38,12 +38,13 @@ browser_viewport { preset: "phone" }      -> re-render at 390×844
 
 | Tool | What it does |
 |---|---|
-| `browser_tabs` | List this Session's browser tabs: id, title, url, loading state, whether each is mounted and drivable, which is `active`, and its `carrier` (`webview` on Desktop, `iframe` on Web). |
-| `browser_read` | Read a tab: `mode: 'text'` (default) for visible text, `'elements'` for the interactive elements you can act on, `'html'` for page HTML. `truncated` means the element cap was reached — hidden elements are filtered out silently and never counted as truncation. |
-| `browser_act` | `click`, `type`, `press`, `scroll`, `select`, or `wait`. Target an element by the `ref` from a `'elements'` read, or by a CSS `selector`. |
-| `browser_screenshot` | Capture the visible viewport as an image block the model can see. Pass a `preset` to size and capture in one call; the result reports the size it actually used. |
+| `browser_tabs` | List this Session's browser tabs: id, title, url, loading state, **whether the load failed** (`failed`), whether the identity was inferred (`unverified`), whether each is mounted and drivable, which is `active`, and its `carrier` (`webview` on Desktop, `iframe` on Web). |
+| `browser_read` | Read a tab: `mode: 'text'` (default) for visible text, `'elements'` for the interactive elements you can act on, `'html'` for page HTML. Check `failed` first — a failed load reads as empty. `truncated` means the element cap was reached — hidden elements are filtered out silently and never counted as truncation. |
+| `browser_act` | `click`, `type`, `press`, `scroll`, `select`, `reload`, or `wait`. Target an element by the `ref` from a `'elements'` read, or by a CSS `selector`. `reload` takes `ignoreCache: true` to bypass the cache. |
+| `browser_screenshot` | Capture the visible viewport as an image block the model can see. Pass a `preset` to size and capture in one call; the result reports the size it actually used and whether the page was confirmed to have reflowed (`confirmed`). A failed page is refused rather than captured. |
 | `browser_navigate` | Open a URL in a new tab, or navigate an existing one. |
-| `browser_viewport` | Read or change the tab's viewport size: `auto`, `phone` (390×844), `tablet` (834×1112), `desktop` (1280×800) or `custom`. The page reflows for real, so its own responsive breakpoints apply. Omit `tabId` to target the only mounted tab; the read always reports the tab it resolved. |
+| `browser_viewport` | Read or change the tab's viewport size: `auto`, `phone` (390×844), `tablet` (834×1112), `desktop` (1280×800) or `custom`. The page reflows for real, so its own responsive breakpoints apply. Omit `tabId` to target the only mounted tab; the read always reports the tab it resolved. `custom` appears only for the `custom` preset. |
+| `browser_close` | Close one tab of this Session, so tabs opened while investigating something can be cleaned up. Closure is confirmed before the call reports success. |
 | `browser_eval` | Run JavaScript in the page. **Off by default** (see configuration). An expression returns its value; a statement body returns what it explicitly `return`s. |
 
 A typical loop:
@@ -56,10 +57,35 @@ browser_act      { action: "click", ref: "e2" }
 browser_read     { mode: "text" }              -> confirm what changed
 browser_screenshot { preset: "desktop" }       -> see the real desktop layout
 browser_screenshot { preset: "phone" }         -> and the 390px-wide one
+browser_close    { tabId: "tab4" }             -> tidy up when finished
 ```
 
 `tabId` may be omitted whenever the Session has exactly one mounted browser tab.
 With several, call `browser_tabs` first and name the one you mean.
+
+### Reading a failed page
+
+Three fields describe three different things, and none of them can be inferred
+from the others:
+
+| Field | Means |
+|---|---|
+| `mounted` | The tab is in the DOM and could be driven — **not** that it loaded. |
+| `loading` | Electron says a navigation is in flight. A *failed* load is not loading. |
+| `failed` | The tab is on Chrome's network-error page, so there is no site content. |
+
+So `mounted: true, loading: false, failed: true` is a completely ordinary
+combination: a tab that is open and finished failing. Before `failed` existed, a
+page that never loaded looked identical to a healthy one, and the only way to
+tell was to read it and notice the text was empty.
+
+`unverified: true` is the other half: the page could not be asked anything (its
+renderer is wedged, or the document is unreachable), so `url` and `title` are the
+last navigation's, not the current document's. Treat them as a hint, not a fact.
+
+Note that this is about *transport* failures only. An HTTP error the site itself
+rendered — a 404 page — is a real document and stays fully readable and
+screenshotable.
 
 ## Which size to use
 
@@ -88,6 +114,55 @@ told. Two ways to act on it:
 Every screenshot result reports the size it actually captured (`preset`,
 `pageWidth`, `pageHeight`, `scale`), so a capture taken at an unintended size is
 visible in the answer rather than silently misleading.
+
+When a size was requested, the result also carries `confirmed`. Resizing writes
+styles, but layout is not synchronous with that write — measuring in the same
+turn reports the **previous** size. That is exactly how `preset: "phone"` once
+came back saying `pageWidth: 1280`: the number was real, it was just stale. The
+plugin now polls until the page agrees (within a pixel) or the confirmation
+budget runs out:
+
+- `confirmed: true` — the page was observed laying out at the requested size.
+- `confirmed: false` — it had not reflowed; `pageWidth` is what it was still
+  using. **Do not judge that breakpoint from this image.**
+
+`browser_viewport` reports `confirmed` the same way, and omits it for `auto`,
+which has no target width to confirm.
+
+## Recovering a stuck or stale tab
+
+Two things go wrong often enough to be worth naming.
+
+**A page that has stopped answering.** Every guest call is bounded by the
+plugin's own budget (6 s for a read or an action, 15 s for a screenshot — a
+capture forces a whole repaint and a heavy page legitimately needs longer). If
+the renderer is wedged you get an error saying so, not a 60-second stall:
+
+```
+browser_act { action: "reload" }
+```
+
+**A change that appears not to have taken effect.** A dev server that sends no
+cache headers — `python -m http.server` is the usual one — lets Chrome serve the
+old CSS and JS under heuristic caching, so fresh files look like they never
+applied. Numbers that "did not change" are the tell:
+
+```
+browser_act { action: "reload", ignoreCache: true }
+```
+
+The result reports `ignoreCache`, which is `false` if the carrier had no
+cache-bypassing reload, so a plain reload is never passed off as a bypass.
+
+Tabs opened while investigating something used to accumulate with no way to
+remove them. They can now be closed:
+
+```
+browser_close { tabId: "tab4" }
+```
+
+Closure is confirmed against the tab list before success is reported, so a close
+the Sidebar ignored is an error rather than a false confirmation.
 
 ## Viewport sizes (phone / desktop / custom)
 
@@ -200,13 +275,14 @@ registry:
     clientInspectTimeoutMs: 60000
 ```
 
-Each browser call spends its own **6 s** budget waiting on the page, deliberately
-under that 10 s default so a slow page answers "still loading" instead of turning
-into an opaque transport timeout. The budget covers the whole call, not one step
-of it: `browser_act { action: "wait" }`, navigation settles and the pause after a
-click all draw from the same deadline, so no single call can outlast the caller.
+Each browser call spends its own budget waiting on the page — **6 s** for a read
+or an action, **15 s** for a screenshot — deliberately under that default so a
+slow page answers "did not answer within 6s" instead of turning into an opaque
+transport timeout. Both cover the whole call, not one step of it:
+`browser_act { action: "wait" }`, navigation settles and the pause after a click
+all draw from the same deadline, so no single call can outlast the caller.
 Raise `clientInspectTimeoutMs` (above) if you want a longer ceiling to spend — the
-plugin's budget stays 6 s, since it is not configurable today.
+plugin's budgets stay as they are, since they are not configurable today.
 
 ## How it works
 
@@ -346,6 +422,20 @@ injection. Treat tool output as data to reason about, never as instructions.
   store is mounted, or the store refuses the image (an oversized capture, for
   instance), the result drops the bytes and explains why in `note` rather than
   failing the call.
+- **Every guest call is bounded by the plugin's own budget.** 6 s for reads and
+  actions, 15 s for a screenshot, and 1 s for the identity probe every method
+  makes. Electron's `executeJavaScript`, `capturePage` and `loadURL` accept no
+  abort signal and no timeout, so an unresponsive renderer never settles; racing
+  a timer is the only bound the plugin controls. Awaiting them bare is what made
+  a stalled page cost a fixed 60 s per call (the Inspect channel's default
+  timeout) — eight of those cost one agent about eight minutes. The budget is not
+  configurable: the Client half cannot read plugin configuration, so it is a
+  constant rather than a setting, and `clientInspectTimeoutMs` still governs the
+  outer channel.
+- **A timed-out operation is not cancelled.** Because Electron cannot abort one,
+  the work may still complete in the background after the call reports the
+  timeout. The message is a statement about how long the plugin waited, never a
+  claim that the work stopped.
 - **A screenshot defaults to the Sidebar column width.** `auto` is
   typically 400–700 CSS px, which is not a real device size. Pass a `preset` (or
   set one with `browser_viewport` first) when the layout matters.
@@ -563,7 +653,7 @@ manager would try to replace the link and pnpm can fail with
 
 ## Tests
 
-Nine suites, no test framework — plain Node scripts that exit non-zero on
+Ten suites, no test framework — plain Node scripts that exit non-zero on
 failure. The executable is located automatically (a sibling install, or
 `DeepSeek Harness.exe` somewhere up the tree); normally you do not pass it.
 
@@ -599,6 +689,7 @@ node test/run-all.cjs --offline
 | `viewport-controller-check` | Which element gets which inline style, centring, fallbacks, unmounted tabs. |
 | `contract-check` | Every tool's **real** result shape — success and degradation — through the registry's own lossless-JSON detach and output-schema validation, plus the `truncated` flag's semantics and active-tab reporting. |
 | `session-scope-check` | That opening a tab is addressed to the **calling** Session, not the on-screen one, and that a tab landing in another Conversation is reported as such rather than as merely unmounted. |
+| `resilience-check` | That a stalled page is bounded by the plugin budget instead of stalling the call; that a viewport change is confirmed rather than assumed; that a failed load is reported as failed and refused by the screenshot path; and that reload/close actually work. A watchdog turns a hang into a failure — without it, removing the bound under test would make the process exit 0 and look green. |
 
 Three of these must run under the packaged executable in Node mode, because they
 import the real validators out of `app.asar`; `run-all.cjs` does that for you.
@@ -608,9 +699,20 @@ runtime: a missing `shortcuts.register` defaults map that silently took the
 entire client half down, `jsx(type, props, key)` labels passed as the React key
 rendering blank buttons, a menu that dismissed itself because `Modal` portals
 outside the kit's click-through boundary, a viewport height that stretched the
-page and broke `100vh`, and a new tab opened through the on-screen entry, which
-put it in another Conversation and let that Conversation's Agent drive the wrong
-project's page.
+page and broke `100vh`, a new tab opened through the on-screen entry, which put
+it in another Conversation and let that Conversation's Agent drive the wrong
+project's page, and a set of reporting bugs that each made a failure look like
+success: an unbounded guest call that stalled for a fixed 60 s, a viewport change
+reported before the page had reflowed, and a failed load that read as healthy
+because Electron's URL overrode the page's.
+
+`test/mutation-probe.cjs` guards the guards. It reintroduces each original defect
+in turn and fails if `resilience-check` does not go red, so a check that has
+quietly stopped covering its defect cannot pass unnoticed:
+
+```bash
+node test/mutation-probe.cjs
+```
 
 `contract-check` exists for the same reason. A green `schema-check` proved
 nothing about whether a result could actually be returned: `browser_viewport`'s
@@ -623,7 +725,7 @@ screenshot branches directly so their shapes cannot drift.
 
 ## Model experience
 
-Seven tools enter the model-facing tool list (six with `enableEval: false`). The
+Eight tools enter the model-facing tool list (seven with `enableEval: false`). The
 tool schemas are stable; results are lossless JSON. Screenshots add one image
 block per call, so they consume image tokens — prefer `browser_read` for text
 and reach for `browser_screenshot` when layout or visual state matters.
@@ -631,9 +733,10 @@ and reach for `browser_screenshot` when layout or visual state matters.
 A tool result never carries a `null` or missing value where the model needs a
 fact to reason with: a screenshot that cannot be delivered says so in `note`
 instead of returning unusable bytes, `browser_read`'s `truncated` distinguishes
-"the list hit its cap" from "hidden elements were filtered", and `browser_tabs`
+"the list hit its cap" from "hidden elements were filtered", `browser_tabs`
 reports each tab's `carrier` so a Web-profile tab is visibly undrivable rather
-than apparently absent.
+than apparently absent, and `failed`/`unverified` say whether a tab has no page
+and whether its identity was observed or inferred.
 
 Screenshots name their own viewport. The result includes `preset`, `pageWidth`,
 `pageHeight` and `scale`, so the model can tell which size it actually captured

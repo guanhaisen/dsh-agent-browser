@@ -54,22 +54,64 @@ window.__ModuleLoader__.load({
     const MAX_ELEMENTS = 300
 
     /**
-     * Total wall-clock budget one provider call may spend waiting on the page,
-     * in milliseconds.
+     * Wall-clock budgets, in milliseconds.
      *
-     * Deliberately below the Inspect channel's client-query timeout (10 s by
-     * default, raisable through `cordis-host-runner.clientInspectTimeoutMs`):
+     * Held in one mutable object so the checks can shrink them: a suite that had
+     * to wait out a real 15 s screenshot budget would take minutes to prove the
+     * bound exists. Production never touches these; the values are the defaults
+     * and are documented per field below.
+     *
+     * `call` is deliberately below the Inspect channel's client-query timeout
+     * (10 s by default, raisable through `cordis-host-runner.clientInspectTimeoutMs`):
      * waiting longer than the caller's deadline only turns a clean "still
      * loading" answer into an opaque transport timeout.
      *
-     * This is a budget for the WHOLE call, not for one step of it. Every wait a
+     * `call` is a budget for the WHOLE call, not for one step of it. Every wait a
      * call performs — settling after a navigation, sleeping for `wait`, settling
      * again — is charged against one deadline started when the call arrived, so
      * a single call can no longer accumulate past the caller's timeout. An
      * earlier build capped each step at 8 s independently, which let
      * `act { action: 'wait' }` spend 16 s and outlive a default 10 s timeout.
+     *
+     * `screenshot` is larger because capturing forces a paint of the whole
+     * guest, and a genuinely heavy page — several iframes each running canvas
+     * work — legitimately needs longer than a DOM read. It is still far below the
+     * 60 s channel default, so a stalled renderer fails in 15 s with an
+     * actionable message instead of burning a whole minute per attempt.
+     *
+     * `identity` bounds the small "who are you?" probe (`location.href` and
+     * `document.title`). Every method wants an identity, so a long budget here
+     * would tax every call; a document that cannot answer this quickly is not
+     * going to answer a read either.
+     *
+     * `confirm` bounds how long a viewport change may spend proving the page
+     * actually reflowed. A real reflow lands within a frame or two; anything
+     * slower means the page is not going to agree, and reporting the
+     * disagreement is more useful than waiting longer for it. `confirmReserve`
+     * is kept back from a viewport change so a capture that follows it still has
+     * time to size, settle and capture.
      */
-    const CALL_BUDGET_MS = 6_000
+    const BUDGETS = {
+      call: 6_000,
+      screenshot: 15_000,
+      identity: 1_000,
+      confirm: 2_000,
+      confirmReserve: 2_000,
+    }
+
+    /**
+     * Whether an address is Chrome's network-error page.
+     *
+     * A failed load leaves the guest on `chrome-error://chromewebdata/`. This is
+     * distinct from an HTTP error status: a 404 is a real document the site
+     * rendered, and stays fully readable. Only a transport-level failure lands
+     * here, so treating it as "this tab has no page" is safe.
+     * @param url - an address from either the page or Electron.
+     * @returns true when it is the error page.
+     */
+    function isErrorPage(url) {
+      return typeof url === 'string' && url.startsWith('chrome-error://')
+    }
 
     /**
      * Share of the call budget a mid-call "let the page react" pause may use.
@@ -79,10 +121,62 @@ window.__ModuleLoader__.load({
 
     /**
      * Start a per-call budget.
+     * @param budgetMs - total budget for this call; defaults to the shared one.
      * @returns an absolute deadline in `Date.now()` terms.
      */
-    function beginCall() {
-      return Date.now() + CALL_BUDGET_MS
+    function beginCall(budgetMs = BUDGETS.call) {
+      return Date.now() + budgetMs
+    }
+
+    /**
+     * Settle a promise within a budget, or fail with an actionable message.
+     *
+     * The Electron guest APIs this plugin calls — `executeJavaScript`,
+     * `capturePage`, `loadURL` — take no abort signal and no timeout: an
+     * unresponsive renderer simply never resolves. Awaiting one bare is what
+     * turned a stalled page into a fixed 60 s stall, because the only remaining
+     * bound was the Inspect channel's own client-query timeout. Racing a timer
+     * gives the call a bound it actually controls.
+     *
+     * The timer is always cleared, and a rejection arriving after the race is
+     * swallowed: the underlying operation is NOT cancelled (Electron offers no
+     * way to), so it may still complete later. Reporting a timeout is therefore
+     * a statement about how long we waited, never a claim that the work stopped.
+     * @param promise - the operation to bound.
+     * @param ms - how long to wait, in milliseconds.
+     * @param what - short description of the operation, for the error.
+     * @returns the promise's value.
+     */
+    async function raceBudget(promise, ms, what) {
+      const budget = Math.max(0, ms)
+      let timer
+      // Mark the original as handled: if the timer wins, this promise rejects
+      // later with nobody awaiting it, which would surface as an unhandled
+      // rejection. Attaching a swallower does not change what the race observes.
+      promise.catch(() => {})
+      try {
+        return await Promise.race([
+          promise,
+          new Promise((_resolve, reject) => {
+            timer = setTimeout(
+              () => {
+                const error = new Error(
+                  `${what} did not answer within ${Math.round(budget / 1000)}s. The page may be busy, ` +
+                    'or its renderer may have stalled; retry, or reload the tab with ' +
+                    "browser_act { action: 'reload' } and try again.",
+                )
+                // Tagged so callers can tell "we ran out of time" apart from
+                // "the page threw", and report the former un-wrapped.
+                error.budgetExceeded = true
+                reject(error)
+              },
+              budget,
+            )
+          }),
+        ])
+      } finally {
+        clearTimeout(timer)
+      }
     }
 
     /**
@@ -826,28 +920,41 @@ window.__ModuleLoader__.load({
        *
        * The measured width is the guest's own `innerWidth`, which is the number
        * the page's media queries actually see — not the scaled box we draw.
+       *
+       * `custom` is reported only when the resolved preset IS `custom`. It used
+       * to be echoed unconditionally from the store, so a read of a `desktop` tab
+       * returned `preset: "desktop"` next to `custom: {width: 320, height: 700}`
+       * — two fields describing different viewports in one answer, with no way to
+       * tell which one the page was actually using.
        * @param sessionId - owning Session.
        * @param tabId - target tab.
+       * @param budgetMs - how long the measurement probe may take.
        * @returns the preset, the page's CSS pixel size, and the display scale.
        */
-      async describe(sessionId, tabId) {
+      async describe(sessionId, tabId, budgetMs = BUDGETS.identity) {
         const frame = this.apply(sessionId, tabId)
         const guest = this.findGuest(sessionId, tabId)
         const snapshot = this.store.getSnapshot()
         const selection = snapshot.byTab[tabId] ?? { preset: snapshot.lastPreset }
+        const preset = selection.preset ?? 'auto'
 
         let measured
         if (guest !== undefined) {
           try {
-            measured = await guest.executeJavaScript('({ w: window.innerWidth, h: window.innerHeight })', true)
+            measured = await raceBudget(
+              guest.executeJavaScript('({ w: window.innerWidth, h: window.innerHeight })', true),
+              budgetMs,
+              'the viewport probe',
+            )
           } catch {
             measured = undefined
           }
         }
         return prune({
           tabId,
-          preset: selection.preset ?? 'auto',
-          custom: snapshot.custom,
+          preset,
+          // Only meaningful for the custom preset; see above.
+          custom: preset === 'custom' ? snapshot.custom : undefined,
           // What the page believes its viewport is.
           pageWidth: measured?.w,
           pageHeight: measured?.h,
@@ -860,13 +967,73 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * Measure how the page is actually laying out right now.
+       * @param guest - the webview element.
+       * @param budgetMs - how long the probe may take.
+       * @returns `{ w, h }`, or undefined when the page could not be asked.
+       */
+      async measure(guest, budgetMs = BUDGETS.identity) {
+        try {
+          const value = await raceBudget(
+            guest.executeJavaScript('({ w: window.innerWidth, h: window.innerHeight })', true),
+            budgetMs,
+            'the viewport probe',
+          )
+          if (value === null || typeof value !== 'object') return undefined
+          if (!Number.isFinite(value.w)) return undefined
+          return { w: value.w, h: Number.isFinite(value.h) ? value.h : undefined }
+        } catch {
+          return undefined
+        }
+      }
+
+      /**
+       * Wait until the page has genuinely reflowed to the requested size.
+       *
+       * Resizing writes styles and then returns, but layout is not synchronous
+       * with that write: measuring in the same turn reports the PREVIOUS size.
+       * That is exactly how a `phone` request came back reporting
+       * `pageWidth: 1280` — the number was real, it was just the old one. Poll
+       * until the page agrees, or the budget runs out, so a stale measurement is
+       * never presented as the result of the change.
+       * @param guest - the webview element.
+       * @param target - `{ width?, height? }`; a missing width means `auto`, which has no target.
+       * @param budgetMs - shared budget for the whole confirmation.
+       * @returns the last measurement and whether it matched.
+       */
+      async confirmSize(guest, target, budgetMs) {
+        if (target.width === undefined) return { measured: undefined, confirmed: undefined }
+        // Cap this below the caller's remaining budget: a screenshot still has to
+        // capture after sizing, and letting confirmation consume everything would
+        // turn "the size did not settle" into "the capture had no time at all".
+        const allowance = Math.min(BUDGETS.confirm, Math.max(0, budgetMs - BUDGETS.confirmReserve))
+        if (allowance <= 0) return { measured: undefined, confirmed: false }
+        const deadline = Date.now() + allowance
+        // The tolerance absorbs sub-pixel rounding, so a 390px request is
+        // satisfied by a 389.5px layout rather than polling to no purpose.
+        const close = (actual, wanted) => Math.abs(actual - wanted) <= 1
+        let measured
+        for (;;) {
+          measured = await this.measure(guest, Math.max(0, deadline - Date.now()))
+          if (measured !== undefined && close(measured.w, target.width)) {
+            if (target.height === undefined || close(measured.h ?? 0, target.height)) {
+              return { measured, confirmed: true }
+            }
+          }
+          if (Date.now() >= deadline) return { measured, confirmed: false }
+          await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now())))
+        }
+      }
+
+      /**
        * Change a tab's viewport preset.
        * @param sessionId - owning Session.
        * @param tabId - target tab.
        * @param input - `{ preset, width?, height? }`.
-       * @returns the resulting description.
+       * @param budgetMs - how long the change and its confirmation may take.
+       * @returns the resulting description, plus `confirmed` when a size was requested.
        */
-      async select(sessionId, tabId, input) {
+      async select(sessionId, tabId, input, budgetMs = BUDGETS.call) {
         const preset = input.preset
         const known = ['auto', 'phone', 'tablet', 'desktop', 'custom']
         if (!known.includes(preset)) {
@@ -884,7 +1051,41 @@ window.__ModuleLoader__.load({
         }
         this.store.actions.set(tabId, preset)
         this.apply(sessionId, tabId)
-        return await this.describe(sessionId, tabId)
+
+        // Confirm the page really reflowed before reporting a size. The stored
+        // choice is a request, not an observation; `resolveViewport` can also
+        // silently fall back (a broken custom size becomes `phone`), so trusting
+        // the request is how a failure to reflow went unnoticed.
+        //
+        // `custom` MUST come from the store, exactly as `apply()` does it: the
+        // per-tab selection records only the preset, so omitting it would resolve
+        // a `custom` request against an undefined size and confirm against the
+        // phone fallback instead of the size that was actually applied.
+        const guest = this.findGuest(sessionId, tabId)
+        const snapshot = this.store.getSnapshot()
+        const target = resolveViewport({
+          preset: snapshot.byTab[tabId]?.preset ?? preset,
+          custom: snapshot.custom,
+        })
+        // One deadline for both steps: this call's contract is that the whole
+        // thing fits in its budget, so confirmation and the measurement that
+        // follows it draw from the same clock rather than starting two.
+        const deadline = Date.now() + Math.max(0, budgetMs)
+        let confirmation = { measured: undefined, confirmed: undefined }
+        if (guest !== undefined) {
+          confirmation = await this.confirmSize(guest, target, Math.max(0, deadline - Date.now()))
+        }
+        const described = await this.describe(sessionId, tabId, Math.max(0, deadline - Date.now()))
+        return prune({
+          ...described,
+          // Echo the size the page was confirmed at, which for a fallback is not
+          // the preset that was asked for.
+          ...(confirmation.measured === undefined
+            ? {}
+            : { pageWidth: confirmation.measured.w, pageHeight: confirmation.measured.h }),
+          ...(confirmation.confirmed === undefined ? {} : { confirmed: confirmation.confirmed }),
+          ...(target.fellBack === undefined ? {} : { fellBack: target.fellBack }),
+        })
       }
 
       /** Drop observation state for a tab that closed. */
@@ -1022,16 +1223,27 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * Run a page-side helper inside a guest.
+       * Run a page-side helper inside a guest, bounded by a budget.
+       *
+       * `executeJavaScript` never settles on an unresponsive renderer, so it is
+       * raced against the remaining budget rather than awaited bare.
        * @param guest - the webview element.
        * @param helper - one of the page-side functions.
        * @param args - JSON-serializable arguments.
+       * @param budgetMs - how long to allow, in milliseconds.
        * @returns the helper's JSON result.
        */
-      async run(guest, helper, args = []) {
+      async run(guest, helper, args = [], budgetMs = BUDGETS.call) {
         try {
-          return await guest.executeJavaScript(pageCall(helper, args), true)
+          return await raceBudget(
+            guest.executeJavaScript(pageCall(helper, args), true),
+            budgetMs,
+            'the page script',
+          )
         } catch (error) {
+          // A budget overrun is not the page refusing anything; say so directly
+          // instead of prefixing it with a claim about the page.
+          if (error?.budgetExceeded === true) throw error
           const message = error instanceof Error ? error.message : String(error)
           throw new Error(`the page refused to run the requested operation: ${message}`)
         }
@@ -1072,33 +1284,57 @@ window.__ModuleLoader__.load({
       /**
        * Describe a guest's current navigation state.
        *
-       * Electron's own observations stay authoritative for the address and title
-       * because a guest mid-navigation can refuse script.
+       * The page's own answer wins whenever it can be given, because it is the
+       * only source that reports a failed navigation truthfully. Electron's
+       * `getURL()`/`getTitle()` keep reporting the REQUESTED address and the
+       * previous document's title after a load failure, so preferring them — as
+       * an earlier build did — made an error page indistinguishable from a
+       * healthy one: `browser_tabs` said `http://localhost:3000/` while
+       * `browser_read` said `chrome-error://chromewebdata/`. They are now a
+       * fallback, and never override a page that answered.
        * @param guest - the webview element.
-       * @returns url, title and loading.
+       * @param budgetMs - how long the identity probe may take.
+       * @returns url, title, loading, whether the load failed, and whether the
+       *   page could be asked at all.
        */
-      async describe(guest) {
-        let identity = { url: '', title: '' }
+      async describe(guest, budgetMs = BUDGETS.identity) {
+        let identity
         try {
-          identity = await this.run(guest, pageIdentity)
+          identity = await this.run(guest, pageIdentity, [], budgetMs)
         } catch {
-          // keep the Electron-observed values below
+          identity = undefined
         }
         const loading = this.isLoading(guest)
-        let url = identity.url
-        try {
-          if (guest.getURL()) url = guest.getURL()
-        } catch {
-          // keep the page-reported url
+
+        let url = identity?.url ?? ''
+        let title = identity?.title ?? ''
+        if (identity === undefined) {
+          try {
+            if (guest.getURL()) url = guest.getURL()
+          } catch {
+            // nothing else can report an address
+          }
+          try {
+            const observed = guest.getTitle()
+            if (observed) title = observed
+          } catch {
+            // keep the page-reported title
+          }
         }
-        let title = identity.title
-        try {
-          const observed = guest.getTitle()
-          if (observed) title = observed
-        } catch {
-          // keep the page-reported title
+        url = url || ''
+        return {
+          url,
+          title: title || '',
+          loading,
+          // Chrome's network-error page. This is the fact `browser_tabs` had no
+          // way to express before: `loading` is false and `mounted` is true for
+          // a failed load, so both fields looked healthy.
+          failed: isErrorPage(url),
+          // The page could not be asked, so url/title describe the LAST
+          // navigation rather than the document now on screen. Reported so a
+          // caller never mistakes an inference for an observation.
+          unverified: identity === undefined,
         }
-        return { url: url || '', title: title || '', loading }
       }
 
       /**
@@ -1138,6 +1374,8 @@ window.__ModuleLoader__.load({
           let title = ''
           let url = ''
           let loading = false
+          let failed = false
+          let unverified = false
           // Only a webview can be asked anything; an iframe guest is mounted but
           // unreadable, and reporting it as unmounted would be a lie the user
           // cannot act on. `carrier` is how the model tells the two apart.
@@ -1146,12 +1384,20 @@ window.__ModuleLoader__.load({
             title = described.title
             url = described.url
             loading = described.loading
+            failed = described.failed
+            unverified = described.unverified
           }
           tabs.push({
             tabId: record.tabId,
             title,
             url,
             loading,
+            // `loading: false` + `mounted: true` also describes a FAILED load,
+            // so neither field alone can be read as "this page is usable".
+            // `failed` is the missing fact, and `unverified` warns that url and
+            // title were inferred rather than read from the document.
+            failed,
+            unverified,
             mounted: entry !== undefined,
             // The app's own active tab when it can report one; otherwise the
             // best available approximation, which is "the one that is drawn".
@@ -1182,33 +1428,36 @@ window.__ModuleLoader__.load({
 
         const loading = this.isLoading(guest)
         if (mode === 'elements') {
-          const result = await this.run(guest, pageReadElements, [MAX_ELEMENTS])
+          const result = await this.run(guest, pageReadElements, [MAX_ELEMENTS], budgetLeft(deadline))
           return prune({
             tabId,
             url: result.url,
             title: result.title,
             loading,
+            failed: isErrorPage(result.url),
             elements: result.elements,
             truncated: result.truncated,
           })
         }
         if (mode === 'html') {
-          const result = await this.run(guest, pageReadHtml, [maxChars])
+          const result = await this.run(guest, pageReadHtml, [maxChars], budgetLeft(deadline))
           return prune({
             tabId,
             url: result.url,
             title: result.title,
             loading,
+            failed: isErrorPage(result.url),
             html: result.html,
             truncated: result.truncated,
           })
         }
-        const result = await this.run(guest, pageReadText, [maxChars])
+        const result = await this.run(guest, pageReadText, [maxChars], budgetLeft(deadline))
         return prune({
           tabId,
           url: result.url,
           title: result.title,
           loading,
+          failed: isErrorPage(result.url),
           text: result.text,
           truncated: result.truncated,
         })
@@ -1237,25 +1486,39 @@ window.__ModuleLoader__.load({
           const waitMs = Math.min(Math.max(0, requested), budgetLeft(deadline))
           await new Promise((resolve) => setTimeout(resolve, waitMs))
           await this.settle(guest, budgetLeft(deadline))
-          return prune({ tabId, action, ok: true, ...(await this.describe(guest)) })
+          return prune({
+            tabId,
+            action,
+            ok: true,
+            ...(await this.describe(guest, budgetLeft(deadline))),
+          })
+        }
+
+        if (action === 'reload') {
+          return await this.reload(sessionId, tabId, guest, input, deadline)
         }
 
         let outcome
         if (action === 'click') {
-          outcome = await this.run(guest, pageClick, [ref, selector])
+          outcome = await this.run(guest, pageClick, [ref, selector], budgetLeft(deadline))
         } else if (action === 'type') {
-          outcome = await this.run(guest, pageType, [ref, selector, input.text ?? ''])
+          outcome = await this.run(guest, pageType, [ref, selector, input.text ?? ''], budgetLeft(deadline))
         } else if (action === 'press') {
-          outcome = await this.run(guest, pagePress, [ref, selector, input.key ?? 'Enter'])
+          outcome = await this.run(guest, pagePress, [ref, selector, input.key ?? 'Enter'], budgetLeft(deadline))
         } else if (action === 'scroll') {
-          outcome = await this.run(guest, pageScroll, [
-            ref,
-            selector,
-            Number.isFinite(input.deltaX) ? input.deltaX : 0,
-            Number.isFinite(input.deltaY) ? input.deltaY : 600,
-          ])
+          outcome = await this.run(
+            guest,
+            pageScroll,
+            [
+              ref,
+              selector,
+              Number.isFinite(input.deltaX) ? input.deltaX : 0,
+              Number.isFinite(input.deltaY) ? input.deltaY : 600,
+            ],
+            budgetLeft(deadline),
+          )
         } else if (action === 'select') {
-          outcome = await this.run(guest, pageSelect, [ref, selector, input.text ?? ''])
+          outcome = await this.run(guest, pageSelect, [ref, selector, input.text ?? ''], budgetLeft(deadline))
         } else {
           throw new Error(`unknown action "${action}"`)
         }
@@ -1267,7 +1530,48 @@ window.__ModuleLoader__.load({
         // Give the page a moment to react so the next read observes the result.
         await new Promise((resolve) => setTimeout(resolve, Math.min(REACTION_PAUSE_MS, budgetLeft(deadline))))
         await this.settle(guest, budgetLeft(deadline))
-        return prune({ tabId, action, ...outcome, ...(await this.describe(guest)) })
+        return prune({ tabId, action, ...outcome, ...(await this.describe(guest, budgetLeft(deadline))) })
+      }
+
+      /**
+       * Reload a tab's page, optionally bypassing the cache.
+       *
+       * This is the recovery path. It exists for two failures seen in practice:
+       * a tab whose renderer has stopped answering (a reload re-navigates it, and
+       * the guest is recreated) and a development server whose assets were
+       * served from Chrome's heuristic cache, which silently makes fresh CSS and
+       * JS look like they never applied — `ignoreCache` is that case, and it is
+       * what `python -m http.server`, which sends no `Cache-Control`, provokes.
+       * @param sessionId - owning Session.
+       * @param tabId - the tab to reload.
+       * @param guest - the webview element.
+       * @param input - `{ ignoreCache? }`.
+       * @param deadline - the call's absolute deadline.
+       * @returns the outcome plus the tab's resulting state.
+       */
+      async reload(sessionId, tabId, guest, input, deadline) {
+        const ignoreCache = input.ignoreCache === true
+        const bypassesCache = typeof guest.reloadIgnoringCache === 'function'
+        if (ignoreCache && !bypassesCache && typeof guest.reload !== 'function') {
+          throw new Error('this carrier cannot reload the page; reloading needs the Desktop webview.')
+        }
+        if (ignoreCache && bypassesCache) guest.reloadIgnoringCache()
+        else if (typeof guest.reload === 'function') guest.reload()
+        else throw new Error('this carrier cannot reload the page; reloading needs the Desktop webview.')
+
+        await this.settle(guest, budgetLeft(deadline))
+        return prune({
+          tabId,
+          action: 'reload',
+          ok: true,
+          // Reported because a carrier that has no cache-bypassing reload still
+          // reloads, and claiming the cache was bypassed would be a lie.
+          ignoreCache: ignoreCache && bypassesCache,
+          ...(ignoreCache && !bypassesCache
+            ? { note: 'this carrier has no cache-bypassing reload, so a plain reload was performed' }
+            : {}),
+          ...(await this.describe(guest, budgetLeft(deadline))),
+        })
       }
 
       /**
@@ -1288,7 +1592,10 @@ window.__ModuleLoader__.load({
        * @returns base64 PNG bytes, dimensions, and the viewport used.
        */
       async screenshot(sessionId, input) {
-        const deadline = beginCall()
+        // A capture forces a paint of the whole guest, which a heavy page
+        // legitimately takes longer to complete than a DOM read, so this call
+        // gets its own (still bounded) budget.
+        const deadline = beginCall(BUDGETS.screenshot)
         const tabId = resolveViewportTab(this, sessionId, input.tabId)
         const { guest, carrier } = this.resolve(sessionId, tabId)
         this.requireDrivable(carrier, 'be captured')
@@ -1297,16 +1604,29 @@ window.__ModuleLoader__.load({
         // webview can be sized, which `requireDrivable` has already established.
         let frame
         if (typeof input.preset === 'string' && input.preset !== '') {
-          frame = await this.viewport.select(sessionId, tabId, input)
+          frame = await this.viewport.select(sessionId, tabId, input, budgetLeft(deadline))
         }
 
         const maxWidth = Number.isFinite(input.maxWidth) ? input.maxWidth : 1568
         await this.settle(guest, budgetLeft(deadline))
 
+        // Refuse to hand back a picture of the failure page. A failed load still
+        // paints — Chrome's error page, or a blank surface if it never rendered
+        // — and returning that as a successful capture is how an agent came to
+        // report a page as "not rendered" and wasted a round diagnosing CSS.
+        const before = await this.describe(guest, Math.min(BUDGETS.identity, budgetLeft(deadline)))
+        if (before.failed) {
+          throw new Error(
+            `this tab is on a failed page load ("${before.url}"), so a screenshot would capture the ` +
+              'browser error page rather than the site. Check that the server is running at the URL ' +
+              'you navigated to, then navigate again (or browser_act { action: \'reload\' }).',
+          )
+        }
+
         if (typeof guest.capturePage !== 'function') {
           throw new Error('this carrier cannot capture the page; screenshots need the Desktop webview.')
         }
-        let image = await guest.capturePage()
+        let image = await raceBudget(guest.capturePage(), budgetLeft(deadline), 'the screenshot')
         const original = image.getSize()
         if (original.width > maxWidth) image = image.resize({ width: maxWidth })
         const dataUrl = image.toDataURL()
@@ -1319,7 +1639,7 @@ window.__ModuleLoader__.load({
           base64: dataUrl.slice(comma + 1),
           width: size.width,
           height: size.height,
-          ...(await this.describe(guest)),
+          ...(await this.describe(guest, budgetLeft(deadline))),
           ...(frame === undefined
             ? {}
             : {
@@ -1327,6 +1647,9 @@ window.__ModuleLoader__.load({
                 pageWidth: frame.pageWidth,
                 pageHeight: frame.pageHeight,
                 scale: frame.scale,
+                // Only meaningful when a size was applied: it says whether the
+                // page was observed laying out at that size before capture.
+                ...(frame.confirmed === undefined ? {} : { confirmed: frame.confirmed }),
               }),
         })
       }
@@ -1379,6 +1702,71 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * Close a browser tab in a named Session.
+       *
+       * The counterpart to `openBrowserTab`, and it exists because the tool set
+       * had no way to undo an open at all: failed attempts left tabs behind that
+       * nothing could remove, so they accumulated across a session. Same scoping
+       * rule as opening — `closeIn` is Session-addressed, and the plain `close`
+       * acts on the on-screen Session, so it is used only when that IS the
+       * caller.
+       * @param sessionId - owning Session.
+       * @param tabId - the tab to close.
+       */
+      closeBrowserTab(sessionId, tabId) {
+        const sidebar = this.ctx.sidebarRight
+        if (sidebar === undefined) {
+          throw new Error(
+            'the in-app browser needs the right Sidebar service, which is not mounted in this composition',
+          )
+        }
+        if (typeof sidebar.closeIn === 'function') {
+          sidebar.closeIn(sessionId, tabId)
+          return
+        }
+        const onScreen = sidebar.mounted?.getSnapshot?.()
+        if (onScreen === sessionId && typeof sidebar.close === 'function') {
+          sidebar.close(tabId)
+          return
+        }
+        throw new Error(
+          'this Session cannot close a browser tab: the right Sidebar exposes no Session-addressed ' +
+            'close, and the on-screen Session is not this one, so closing would affect another ' +
+            'Conversation. Open this Conversation so its Sidebar is on screen, then retry.',
+        )
+      }
+
+      /**
+       * Close one tab and confirm it is gone.
+       *
+       * `closeIn` is a silent no-op for a Session whose store was never adopted,
+       * so a successful call is not by itself proof the tab closed; the poll is
+       * what makes the answer true.
+       * @param sessionId - owning Session.
+       * @param tabId - the tab to close.
+       * @returns `{ tabId, closed }`.
+       */
+      async closeTab(sessionId, tabId) {
+        const deadline = beginCall()
+        // Validate up front. Polling for absence cannot detect a tab that was
+        // never there, so without this an unknown id would "succeed" instantly.
+        if (!this.inventory(sessionId).some((tab) => tab.tabId === tabId)) {
+          throw new Error(`no browser tab "${tabId}" in this Session. Call browser_tabs to list them.`)
+        }
+        this.closeBrowserTab(sessionId, tabId)
+        while (budgetLeft(deadline) > 0) {
+          if (!this.inventory(sessionId).some((tab) => tab.tabId === tabId)) {
+            return { tabId, closed: true }
+          }
+          await new Promise((resolve) => setTimeout(resolve, Math.min(50, budgetLeft(deadline))))
+        }
+        throw new Error(
+          `the browser tab "${tabId}" is still open: this Conversation's Sidebar did not accept the ` +
+            'close. Open this Conversation so its Sidebar is on screen, then retry.',
+        )
+      }
+
+      /**
        * Explain why a just-requested tab never became drivable in this Session.
        *
        * The causes need different fixes, and one message covering all of them
@@ -1426,9 +1814,18 @@ window.__ModuleLoader__.load({
         if (typeof input.tabId === 'string' && input.tabId !== '') {
           const resolved = this.resolve(sessionId, input.tabId)
           this.requireDrivable(resolved.carrier, 'be navigated')
-          await resolved.guest.loadURL(url)
+          // `loadURL` never settles against a server that accepts the connection
+          // and then stalls, so it is bounded like every other guest call.
+          await raceBudget(
+            resolved.guest.loadURL(url),
+            budgetLeft(deadline),
+            'the navigation',
+          )
           await this.settle(resolved.guest, budgetLeft(deadline))
-          return prune({ tabId: resolved.tabId, ...(await this.describe(resolved.guest)) })
+          return prune({
+            tabId: resolved.tabId,
+            ...(await this.describe(resolved.guest, budgetLeft(deadline))),
+          })
         }
 
         const before = new Set(this.inventory(sessionId).map((tab) => tab.tabId))
@@ -1449,7 +1846,10 @@ window.__ModuleLoader__.load({
             if (entry) {
               this.requireDrivable(entry.carrier, 'be navigated')
               await this.settle(entry.element, budgetLeft(deadline))
-              return prune({ tabId: created.tabId, ...(await this.describe(entry.element)) })
+              return prune({
+                tabId: created.tabId,
+                ...(await this.describe(entry.element, budgetLeft(deadline))),
+              })
             }
           }
           await new Promise((resolve) => setTimeout(resolve, Math.min(100, budgetLeft(deadline))))
@@ -1470,8 +1870,8 @@ window.__ModuleLoader__.load({
         const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
         this.requireDrivable(carrier, 'run script')
         await this.settle(guest, budgetLeft(deadline))
-        const result = await this.run(guest, pageEval, [code])
-        return prune({ tabId, ...result, ...(await this.describe(guest)) })
+        const result = await this.run(guest, pageEval, [code], budgetLeft(deadline))
+        return prune({ tabId, ...result, ...(await this.describe(guest, budgetLeft(deadline))) })
       }
     }
 
@@ -1859,14 +2259,15 @@ window.__ModuleLoader__.load({
             },
             {
               name: 'act',
-              description: 'Perform one interaction on a browser tab: click, type, press, scroll, select or wait.',
+              description:
+                'Perform one interaction on a browser tab: click, type, press, scroll, select, reload or wait.',
               inputSchema: {
                 type: 'object',
                 properties: {
                   tabId: TAB_ID,
                   action: {
                     type: 'string',
-                    enum: ['click', 'type', 'press', 'scroll', 'select', 'wait'],
+                    enum: ['click', 'type', 'press', 'scroll', 'select', 'reload', 'wait'],
                     description: 'Interaction to perform.',
                   },
                   ref: { type: 'string', description: 'Element ref from a browser_read elements result.' },
@@ -1876,6 +2277,12 @@ window.__ModuleLoader__.load({
                   deltaX: { type: 'number', description: 'Horizontal scroll pixels.' },
                   deltaY: { type: 'number', description: 'Vertical scroll pixels.' },
                   timeoutMs: { type: 'number', description: 'Wait budget for the wait action.' },
+                  ignoreCache: {
+                    type: 'boolean',
+                    description:
+                      'For reload: bypass the cache, so freshly edited CSS or JS is actually re-fetched. ' +
+                      'Use it when a change appears not to have taken effect.',
+                  },
                 },
                 required: ['action'],
                 additionalProperties: false,
@@ -1962,6 +2369,17 @@ window.__ModuleLoader__.load({
               },
               outputSchema: ANY_OUTPUT,
             },
+            {
+              name: 'closeTab',
+              description: 'Close one browser tab of this Session, so tabs opened during a task can be cleaned up.',
+              inputSchema: {
+                type: 'object',
+                properties: { tabId: TAB_ID },
+                required: ['tabId'],
+                additionalProperties: false,
+              },
+              outputSchema: ANY_OUTPUT,
+            },
           ],
         },
         async query(method, input, context) {
@@ -1973,6 +2391,13 @@ window.__ModuleLoader__.load({
           if (method === 'screenshot') return await driver.screenshot(sessionId, args)
           if (method === 'navigate') return await driver.navigate(sessionId, args)
           if (method === 'eval') return await driver.evaluate(sessionId, args)
+          if (method === 'closeTab') {
+            const tabId = typeof args.tabId === 'string' && args.tabId !== '' ? args.tabId : undefined
+            if (tabId === undefined) {
+              throw new Error('closing a tab needs its tabId; call browser_tabs to list them')
+            }
+            return await driver.closeTab(sessionId, tabId)
+          }
           if (method === 'getViewport') {
             return await viewport.describe(sessionId, resolveViewportTab(driver, sessionId, args.tabId))
           }
@@ -2155,7 +2580,13 @@ window.__ModuleLoader__.load({
     exports.inject = inject
     exports.PROVIDER = PROVIDER
     exports.buildProvider = buildProvider
-    /** Test seam: the pure sizing helpers, exercised by test/viewport-check.cjs. */
+    /**
+     * Test seams.
+     *
+     * `budgets` is exposed so a check can shrink a wall-clock bound instead of
+     * waiting it out: proving the screenshot budget exists must not cost 15 real
+     * seconds. Production never writes to it.
+     */
     exports.__viewport = {
       computeScale,
       computePlacement,
@@ -2166,6 +2597,7 @@ window.__ModuleLoader__.load({
       VIEWPORT_LIMITS,
       ViewportController,
       viewportStore,
+      budgets: BUDGETS,
       /** Seed the module-scope runtime the menu and settings row read. */
       setRuntime: (runtime) => {
         viewportRuntime = runtime

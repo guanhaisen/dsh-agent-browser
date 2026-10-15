@@ -501,12 +501,10 @@ async function main() {
       toDataURL: () => 'data:image/png;base64,AAAA',
     })
     const shot = await provider.query('screenshot', {}, { sessionId: 's1' })
+    // Spread the real result rather than hand-listing fields: rebuilding it here
+    // is what let a required field drift out of the check unnoticed.
     assertAccepted('browser_screenshot success result passes both registry stages', 'browser_screenshot', {
-      tabId: shot.tabId,
-      url: shot.url,
-      title: shot.title,
-      width: shot.width,
-      height: shot.height,
+      ...shot,
       image: [{ type: 'image', attachment: 'sha256:x' }],
     })
     check('screenshot returns PNG bytes and dimensions', shot.base64 === 'AAAA' && shot.width === 10, shot)
@@ -563,6 +561,9 @@ async function main() {
             width: 10,
             height: 10,
             mediaType: 'image/png',
+            // The real driver always reports this, from describe(): a successful
+            // capture is only reachable when the load did NOT fail.
+            failed: false,
             base64,
             ...extra,
           }),

@@ -30,12 +30,13 @@ browser_viewport { preset: "phone" }      -> 以 390×844 重新渲染
 
 | 工具 | 作用 |
 |---|---|
-| `browser_tabs` | 列出当前 Session 的浏览器 tab：id、标题、url、加载状态、是否已挂载可驱动、哪个是 `active`，以及它的 `carrier`（桌面端为 `webview`，Web 为 `iframe`）。 |
-| `browser_read` | 读取一个 tab：`mode: 'text'`（默认）返回可见文本，`'elements'` 返回可操作的交互元素，`'html'` 返回页面 HTML。`truncated` 表示撞到了元素数量上限 —— 隐藏元素会被静默过滤，绝不计入截断。 |
-| `browser_act` | `click`、`type`、`press`、`scroll`、`select` 或 `wait`。用 `'elements'` 读取得到的 `ref` 定位元素，或用 CSS `selector`。 |
-| `browser_screenshot` | 截取可见视口，作为模型能看到的图片块返回。传 `preset` 即可一次调用完成「设尺寸 + 截图」；结果会报告它实际使用的尺寸。 |
+| `browser_tabs` | 列出当前 Session 的浏览器 tab：id、标题、url、加载状态、**加载是否失败**（`failed`）、身份是否为推断（`unverified`）、是否已挂载可驱动、哪个是 `active`，以及它的 `carrier`（桌面端为 `webview`，Web 为 `iframe`）。 |
+| `browser_read` | 读取一个 tab：`mode: 'text'`（默认）返回可见文本，`'elements'` 返回可操作的交互元素，`'html'` 返回页面 HTML。先看 `failed` —— 加载失败的页面读出来是空的。`truncated` 表示撞到了元素数量上限 —— 隐藏元素会被静默过滤，绝不计入截断。 |
+| `browser_act` | `click`、`type`、`press`、`scroll`、`select`、`reload` 或 `wait`。用 `'elements'` 读取得到的 `ref` 定位元素，或用 CSS `selector`。`reload` 可传 `ignoreCache: true` 绕过缓存。 |
+| `browser_screenshot` | 截取可见视口，作为模型能看到的图片块返回。传 `preset` 即可一次调用完成「设尺寸 + 截图」；结果会报告它实际使用的尺寸，以及页面是否已被确认按该尺寸重排（`confirmed`）。加载失败的页面会被拒绝，而不是被截下来。 |
 | `browser_navigate` | 在新 tab 打开 URL，或导航已有 tab。 |
-| `browser_viewport` | 读取或修改 tab 的视口尺寸：`auto`、`phone`（390×844）、`tablet`（834×1112）、`desktop`（1280×800）或 `custom`。页面会真实重排，因此站点自身的响应式断点会生效。省略 `tabId` 时作用于唯一已挂载的 tab；读取时总会报告它实际解析到的 tab。 |
+| `browser_viewport` | 读取或修改 tab 的视口尺寸：`auto`、`phone`（390×844）、`tablet`（834×1112）、`desktop`（1280×800）或 `custom`。页面会真实重排，因此站点自身的响应式断点会生效。省略 `tabId` 时作用于唯一已挂载的 tab；读取时总会报告它实际解析到的 tab。`custom` 字段只在 `custom` 预设下出现。 |
+| `browser_close` | 关闭当前 Session 的某个 tab，便于清理排查过程中打开的标签。关闭结果会被确认后才报告成功。 |
 | `browser_eval` | 在页面中执行 JavaScript。**默认关闭**（见配置）。表达式返回其值；语句体返回它显式 `return` 的内容。 |
 
 一次典型循环：
@@ -48,9 +49,26 @@ browser_act      { action: "click", ref: "e2" }
 browser_read     { mode: "text" }              -> 确认变化
 browser_screenshot { preset: "desktop" }       -> 查看真实的桌面版面
 browser_screenshot { preset: "phone" }         -> 以及 390px 宽的版面
+browser_close    { tabId: "tab4" }             -> 收尾时清理
 ```
 
 当 Session 只有一个已挂载的浏览器 tab 时，可以省略 `tabId`。若有多个，先调用 `browser_tabs`，并指明你要用的那个。
+
+### 如何判断页面加载失败
+
+三个字段描述三件不同的事，任何一个都不能由其它推断出来：
+
+| 字段 | 含义 |
+|---|---|
+| `mounted` | tab 在 DOM 中、可被驱动 —— **不**代表它加载成功了。 |
+| `loading` | Electron 认为有导航正在进行。**加载失败不算 loading。** |
+| `failed` | tab 停在 Chrome 的网络错误页上，因此没有任何站点内容。 |
+
+所以 `mounted: true, loading: false, failed: true` 是完全正常的组合：一个已打开、且刚刚失败完的标签。在 `failed` 出现之前，一个从未加载成功的页面与健康页面**看起来完全一样**，唯一的分辨办法是去读它、然后注意到正文是空的。
+
+`unverified: true` 是另一半：页面完全无法被询问（渲染进程卡死，或文档不可达），此时 `url` 与 `title` 来自**上一次导航**，而不是当前文档。把它们当线索，不要当事实。
+
+注意这只针对**传输层**失败。站点自己渲染出来的 HTTP 错误（比如 404 页面）是真实文档，依然可以正常读取和截图。
 
 ## 该用哪个尺寸
 
@@ -90,6 +108,13 @@ browser_screenshot { preset: "phone" }         -> 以及 390px 宽的版面
 
 读取时按与写入相同的方式解析隐式 tab，因此 `tabId` 总会被报告 —— 省略它时作用于 Session 中唯一的浏览器 tab；指名一个不存在的 tab 会被拒绝，并给出与其它工具相同的错误。
 
+请求改变尺寸时，结果还会带上 `confirmed`。写入样式之后，布局**并不是同步**完成的 —— 在同一轮里测量，读到的是**上一次**的尺寸。这正是 `preset: "phone"` 曾经回报 `pageWidth: 1280` 的原因：那个数字是真的，只是过期的。现在插件会轮询到页面认同为止（容差 1 像素），或直到确认预算耗尽：
+
+- `confirmed: true` —— 已观测到页面按请求的尺寸排版。
+- `confirmed: false` —— 页面还没重排；`pageWidth` 是它当前仍在使用的尺寸。**不要据此判断该断点。**
+
+`browser_viewport` 以同样方式报告 `confirmed`；`auto` 没有可确认的目标宽度，因此不输出该字段。
+
 ### 实现原理，以及为何不用 zoom
 
 guest 是 Electron `<webview>`，而该元素的盒子**就是**页面的视口：宽 390px 的元素会让文档以 390 CSS 像素排版。要在窄栏中显示更宽的视口，只对显示做缩放：把元素放在裁剪容器内缩小，并在 Sidebar 尺寸变化时由 `ResizeObserver` 重算缩放比。页面排版保持真实，只有呈现被缩小。读取结果里的 `pageWidth` 来自 guest 自身的 `window.innerWidth`，因此它报告的始终是页面的真实认知。
@@ -111,6 +136,32 @@ guest 是 Electron `<webview>`，而该元素的盒子**就是**页面的视口�
 - 已打开但未挂载的 tab 暂时无法调整；选择会被保存，并在你点击该 tab 的瞬间应用。恢复的 Session 会在加载后不久重新应用已保存的预设。
 - 尺寸按 tab 记忆，存于 `localStorage` 的 `dsh.agent-browser.viewport.v1`，重启后依然有效。
 - **高度同样是预设的真实高度。**一个“电脑 1280×800”的 tab 会以恰好 1280×800 排版，然后在栏内缩小绘制。曾尝试把高度放大以填满栏位，但被否决：那会拉伸视口（该预设排成了 1571px 高），并静默破坏 `100vh` 和所有按高度布局的页面。因此缩放结果常比栏更矮 —— 现在表现为页面上下两侧均衡的留白。
+
+## 恢复卡住或陈旧的标签
+
+有两件事出得足够频繁，值得单独说明。
+
+**页面不再响应。**每次 guest 调用都受插件自身预算约束（读取或动作 6 秒，截图 15 秒 —— 截图要强制整页重绘，重页面确实需要更久）。渲染进程卡死时你会得到一句说明，而不是 60 秒的干等：
+
+```
+browser_act { action: "reload" }
+```
+
+**改动看起来没生效。**不发缓存头的开发服务器 —— 常见的是 `python -m http.server` —— 会让 Chrome 以启发式缓存继续端上旧的 CSS 和 JS，于是新文件看起来从没应用过。数字「没有变化」就是征兆：
+
+```
+browser_act { action: "reload", ignoreCache: true }
+```
+
+结果里的 `ignoreCache` 会在该载体没有绕过缓存的 reload 时为 `false`，因此一次普通重载绝不会被说成绕过。
+
+排查过程中打开的标签以前会只增不减、无从清理。现在可以关闭：
+
+```
+browser_close { tabId: "tab4" }
+```
+
+关闭会先对照标签清单确认，才报告成功，因此被 Sidebar 忽略的关闭是一个错误，而不是一次虚假的确认。
 
 ## 配置
 
@@ -138,7 +189,7 @@ Inspect 通道还有一个进程级的 client 查询超时，默认 10 秒。较
     clientInspectTimeoutMs: 60000
 ```
 
-每次浏览器调用有自己 **6 秒**的预算用于等待页面，刻意低于上述 10 秒默认值，以便较慢的页面回答“仍在加载”，而不会变成不透明的传输超时。该预算覆盖整次调用，而非其中某一步：`browser_act { action: "wait" }`、导航后的 settle、点击后的停顿都从同一个截止时间中扣除，因此任何单次调用都不会超出调用方。若想要更高的上限，请调高上面的 `clientInspectTimeoutMs` —— 插件自身的预算仍为 6 秒，目前不可配置。
+每次浏览器调用有自己等待页面的预算 —— 读取或动作 **6 秒**，截图 **15 秒** —— 刻意低于上述默认值，以便较慢的页面回答「6 秒内没有响应」，而不会变成不透明的传输超时。两者都覆盖整次调用，而非其中某一步：`browser_act { action: "wait" }`、导航后的 settle、点击后的停顿都从同一个截止时间中扣除，因此任何单次调用都不会超出调用方。若想要更高的上限，请调高上面的 `clientInspectTimeoutMs` —— 插件自身的预算不可配置。
 
 ## 实现结构
 
@@ -192,6 +243,8 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
 - **`jsx(type, props, key)` 的第三个参数是 React key，而非 children。**本插件曾经正是因此出过 bug：把标签文字传到第三个参数，编译通过却渲染出*空白*按钮（线上菜单显示了六行空项）。children 始终应放进 `props.children`。`test/apply-check.cjs` 断言每个菜单项都带有非空标签。
 - **一个 `store` handle 只能挂载在一个 slot scope 下。**在注册项上声明 `store` 会让渲染器绑定 `useStore`/`actions`，但同一个 handle 无法挂在两个不同 scope 下 —— 本插件需要把状态同时用于 session scope 的座位（tab 菜单）与 root scope 的座位（设置 → 通用），这样做会抛出 `store handle mounted under … is already mounted under scope …`。因此 store 以普通 prop 传递，组件直接用 `React.useSyncExternalStore` 订阅。快照必须保持引用稳定；`test/apply-check.cjs` 断言组件未声明 `store` handle。
 - **无法交付的截图仍会正常作答。**若未挂载 attachment store，或 store 拒绝了该图片（例如截图过大），结果会丢弃字节并在 `note` 中说明原因，而不是让调用失败。
+- **每次 guest 调用都受插件自身预算约束。**读取与动作 6 秒，截图 15 秒，每个方法都会做的那次身份探测 1 秒。Electron 的 `executeJavaScript`、`capturePage` 与 `loadURL` 都不接受 abort signal，也没有超时，因此无响应的渲染进程永远不会 settle；与定时器竞速是插件唯一能掌握的界限。裸 await 它们，正是让一个卡死页面每次调用固定花掉 60 秒的原因（Inspect 通道的默认超时）—— 一位 agent 撞上 8 次，等了约 8 分钟。该预算不可配置：client 半身读不到插件配置，所以它是常量而非设置项；外层的 `clientInspectTimeoutMs` 依然生效。
+- **超时并不等于取消。**因为 Electron 无法中止，操作可能在调用报告超时之后仍在后台完成。那条消息说的是插件等了多久，绝不是声称工作已经停止。
 - **截图默认使用 Sidebar 栏宽。**`auto` 通常是 400–700 CSS 像素，并非真实设备尺寸。当版面重要时，请传 `preset`（或先用 `browser_viewport` 设好）。
 - **截图只含视口** —— 没有整页截图。
 - **`ref` 会在页面重新渲染后失效。**过期的 ref 会被拒绝，并提示你重新读取元素；绝不猜测。
@@ -276,7 +329,7 @@ dsh plugin --profile desktop add 'github:guanhaisen/dsh-agent-browser#v0.1.0'
 
 ### 控件出现的位置
 
-- 模型获得六个工具（`enableEval: true` 时七个）。
+- 模型获得七个工具（`enableEval: true` 时八个）。
 - **右键点击浏览器 tab**，可看到*视口尺寸*（自适应 / 手机 / 平板 / 电脑 / 自定义）。
 - **设置 → 通用 → 浏览器视口**设置新 tab 的默认值。
 - `browser.viewport.cycle` 已注册但**默认不绑定按键**；想要键盘快捷键请到*设置 → 快捷键*绑定。
@@ -350,7 +403,7 @@ dsh plugin --profile desktop remove dsh-agent-browser
 
 ## 测试
 
-九个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
+十个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
 
 ```bash
 node test/run-all.cjs
@@ -381,16 +434,23 @@ node test/run-all.cjs --offline
 | `viewport-controller-check` | 哪个元素获得哪些内联样式、居中、回退、未挂载的 tab。 |
 | `contract-check` | 每个工具的**真实**结果形状 —— 成功与降级 —— 经过注册表自身的 lossless-JSON detach 与输出 schema 校验，外加 `truncated` 标志语义与活动 tab 报告。 |
 | `session-scope-check` | 打开 tab 时以**发起调用的** Session 为地址，而不是屏幕上显示的那个；以及落进别的对话的 tab 会被如实点名，而不是被说成仅仅「未挂载」。 |
+| `resilience-check` | 卡死的页面会被插件预算兜住而不是拖住整次调用；视口改变是被确认的而不是被假定的；加载失败会被如实报告且被截图路径拒绝；reload / close 真的有效。看门狗把「挂住」变成失败 —— 没有它，移除被测的那道界限会让进程以 0 退出，看起来一片绿。 |
 
 其中三个必须在打包后的可执行文件里以 Node 模式运行，因为它们从 `app.asar` 导入真实校验器；`run-all.cjs` 会替你处理。
 
-若干断言的存在，是因为曾经出过只在运行时才可见的 bug：遗漏 `shortcuts.register` 的 defaults 会静默让整个 client 半身失效；`jsx(type, props, key)` 把标签当作 React key 会渲染出空白按钮；`Modal` portal 到 kit 的点击穿透边界之外会让菜单自我关闭；视口高度被拉伸会破坏 `100vh`；以及新 tab 走 on-screen 入口打开，结果落进另一个对话，让那个对话的 agent 去驱动了错误项目的页面。
+若干断言的存在，是因为曾经出过只在运行时才可见的 bug：遗漏 `shortcuts.register` 的 defaults 会静默让整个 client 半身失效；`jsx(type, props, key)` 把标签当作 React key 会渲染出空白按钮；`Modal` portal 到 kit 的点击穿透边界之外会让菜单自我关闭；视口高度被拉伸会破坏 `100vh`；新 tab 走 on-screen 入口打开，结果落进另一个对话，让那个对话的 agent 去驱动了错误项目的页面；以及一组**把失败伪装成成功**的报告缺陷：无约束的 guest 调用会固定卡满 60 秒、页面尚未重排就报告视口已改、加载失败的页面因为 Electron 的 URL 覆盖了页面的 URL 而看起来健康。
+
+`test/mutation-probe.cjs` 守护这些守护者：它逐个重新引入原始缺陷，如果 `resilience-check` 没有变红就报错，因此某个检查悄悄失去覆盖时无法蒙混过关：
+
+```bash
+node test/mutation-probe.cjs
+```
 
 `contract-check` 出于同样的原因存在。绿色的 `schema-check` 完全不能证明某个结果真的能被返回：`browser_viewport` 的读取遗漏了它自己输出 schema 所要求的 `tabId`，而 `browser_screenshot` 的两条兜底路径都输出了 `base64: undefined`，而注册表的 lossless-JSON detach 会直接拒绝后者 —— 于是一个文档中写明可用的读取调用、以及每一次优雅的截图降级，都会在运行时抛错。该套件现在把每个工具的真实结果送入注册表的两个阶段，并直接驱动 Host 的截图分支，使其形状无法漂移。
 
 ## 模型体验
 
-七个工具进入模型可见的工具列表（`enableEval: false` 时六个）。工具 schema 稳定；结果是 lossless JSON。截图每次调用会增加一个图片块，因此消耗图片 token —— 文本优先用 `browser_read`，当版面或视觉状态重要时再用 `browser_screenshot`。
+八个工具进入模型可见的工具列表（`enableEval: false` 时七个）。工具 schema 稳定；结果是 lossless JSON。截图每次调用会增加一个图片块，因此消耗图片 token —— 文本优先用 `browser_read`，当版面或视觉状态重要时再用 `browser_screenshot`。
 
 工具结果绝不会在模型需要据以推理的事实位置上给出 `null` 或缺失值：无法交付的截图会在 `note` 中说明，而不是返回不可用的字节；`browser_read` 的 `truncated` 区分“列表撞到了上限”与“隐藏元素被过滤”；`browser_tabs` 会报告每个 tab 的 `carrier`，因此 Web profile 的 tab 是**可见地不可驱动**，而不是看起来根本不存在。
 
