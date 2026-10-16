@@ -40,6 +40,7 @@ const pureChecks = [
   ['viewport controller behavior', 'viewport-controller-check.cjs'],
   ['tab opening stays in its Session', 'session-scope-check.cjs'],
   ['stalled pages, error pages and recovery', 'resilience-check.cjs'],
+  ['host error explanations', 'host-error-check.cjs'],
 ]
 
 // `--offline` is authoritative, not a fallback: it means "skip the checks

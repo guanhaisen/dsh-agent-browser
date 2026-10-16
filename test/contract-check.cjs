@@ -801,6 +801,31 @@ async function main() {
         outcome.message,
       )
     }
+
+    // A provider that ANSWERED with a failure is neither unreachable nor the
+    // Session's fault, and reporting it as either buries the only real diagnosis.
+    // Measured live: every screenshot failure was explained as "the browser is not
+    // reachable; use a Desktop Session" while `browser_read` worked against the
+    // same tab on that same Desktop Session — the browser was fine and the
+    // provider's own reason (a capture timeout, and separately an Electron
+    // GUEST_VIEW_MANAGER_CALL UnknownVizError) was what mattered. Note the shape:
+    // the provider answer is WRAPPED in the channel's `timed out after …`, so a
+    // classifier that tests for "timed out" first swallows the diagnosis.
+    const answered = [
+      'AgentBrowser.screenshot: Client inspect query AgentBrowser.screenshot timed out after 60000ms. Client failure: provider-error: the screenshot did not answer within 13s.',
+      "AgentBrowser.screenshot: Client inspect query AgentBrowser.screenshot timed out after 60000ms. Client failure: provider-error: Error invoking remote method 'GUEST_VIEW_MANAGER_CALL': Error: UnknownVizError.",
+    ]
+    for (const message of answered) {
+      const outcome = await withFailure(message)
+      check(
+        `the Host surfaces a provider failure instead of blaming reachability: ${message.slice(-40)}…`,
+        outcome.threw &&
+          !/not reachable from this Session/.test(outcome.message) &&
+          !/Use a Desktop Session/.test(outcome.message) &&
+          outcome.message.includes('Client failure:'),
+        outcome.message,
+      )
+    }
   }
 
   console.log(failures === 0 ? '\nALL CONTRACT CHECKS PASSED' : `\n${failures} FAILURES`)

@@ -45,7 +45,7 @@ browser_viewport { preset: "phone" }      -> re-render at 390×844
 | `browser_navigate` | Open a URL in a new tab, or navigate an existing one. |
 | `browser_viewport` | Read or change the tab's viewport size: `auto`, `phone` (390×844), `tablet` (834×1112), `desktop` (1280×800) or `custom`. The page reflows for real, so its own responsive breakpoints apply. Omit `tabId` to target the only mounted tab; the read always reports the tab it resolved. `custom` appears only for the `custom` preset. |
 | `browser_close` | Close one tab of this Session, so tabs opened while investigating something can be cleaned up. Closure is confirmed before the call reports success. |
-| `browser_eval` | Run JavaScript in the page. **Off by default** (see configuration). An expression returns its value; a statement body returns what it explicitly `return`s. |
+| `browser_eval` | Run JavaScript in the page — the only way to read layout geometry (`getBoundingClientRect`, `scrollHeight`, `getComputedStyle`). **Always listed; refuses until `enableEval: true`** (see configuration), so the capability is discoverable instead of unguessable. An expression returns its value; a statement body returns what it explicitly `return`s. |
 
 A typical loop:
 
@@ -129,6 +129,25 @@ Every screenshot result reports the size it actually captured (`preset`,
 `pageWidth`, `pageHeight`, `scale`), so a capture taken at an unintended size is
 visible in the answer rather than silently misleading.
 
+Three of those fields are easy to misread, and a report misread two of them, so
+they are worth stating plainly:
+
+| Field | What it is |
+|---|---|
+| `width` / `height` | The **delivered image's** pixels, capped by `maxWidth` (`screenshotMaxWidth`, 1568 by default). Not the viewport, and not a fixed output canvas. |
+| `pageWidth` / `pageHeight` | The **viewport** the page laid out at, in CSS pixels. This is the size the page's own media queries saw. |
+| `scale` | The display shrink **inside the Sidebar column**: `scale === columnWidth / pageWidth`. |
+| `columnWidth` | The column width `scale` is a ratio of, so the conversion never has to be reverse-engineered. |
+
+The misreading is worth recording because it was a coincidence: two different
+presets (`desktop` 1280×800 and `custom` 1440×900) both returned `1568×980`, which
+looks exactly like a fixed 16:10 canvas. Both were 16:10 *and* both exceeded the
+1568 cap, and the cap is the real explanation — `1568×800/1280 = 980` and
+`1568×900/1440 = 980`. A `phone` capture (390×844) is well under the cap and is
+delivered at its own size. Likewise `scale × pageWidth` came out as the same 767
+for both presets, which is simply the column width, not a conversion factor for
+the image.
+
 When a size was requested, the result also carries `confirmed`. Resizing writes
 styles, but layout is not synchronous with that write — measuring in the same
 turn reports the **previous** size. That is exactly how `preset: "phone"` once
@@ -145,16 +164,36 @@ which has no target width to confirm.
 
 ## Recovering a stuck or stale tab
 
-Two things go wrong often enough to be worth naming.
+Three things go wrong often enough to be worth naming.
+
+**A screenshot that fails while the page reads fine.** This is the confusing one,
+and the diagnosis is now in the error. `keepMounted` keeps every visited tab in
+the DOM so the tools can reach one you are not looking at — but only the SELECTED
+tab of the on-screen pane is drawn, and **a hidden guest is not composited**. A
+capture aimed at a hidden tab waits for a frame that never arrives, which is why
+the failure "sticks", why `browser_read` keeps working against the same tab, and
+why **reloading does not help** (it cannot change whether a tab is being drawn).
+The fix is to make the tab the drawn one:
+
+> Click this tab in the right Sidebar so it becomes the shown one, then retry.
+
+Every failed capture now says which of these it was, from the host DOM: an
+ancestor is hidden (the Conversation is not on screen), the Sidebar is collapsed,
+another tab is the one being shown (named), or visibility is ruled *out* because
+the tab really is the drawn one. When the shell exposes none of those signals the
+diagnosis says nothing rather than guessing — "ruled out" is only claimed from
+evidence.
 
 **A page that has stopped answering.** Every guest call is bounded by the
 plugin's own budget (6 s for a read or an action, 15 s for a screenshot — a
-capture forces a whole repaint and a heavy page legitimately needs longer). If
-the renderer is wedged you get an error saying so, not a 60-second stall:
-
-```
-browser_act { action: "reload" }
-```
+capture forces a whole repaint and a heavy page legitimately needs longer). A
+stalled renderer produces an error saying so instead of a 60-second stall. Note
+what the budget does and does not buy you: it bounds how long the *browser* waits
+before giving up. The Inspect channel then has its own timeout, and when the
+Client reports a failure the registry keeps that as a diagnostic and does **not**
+settle the query — so the caller still waits out `clientInspectTimeoutMs` before
+being told. Both numbers appear in the message and neither is the cause; the
+plugin's own reason is the one to act on.
 
 **A change that appears not to have taken effect.** A dev server that sends no
 cache headers — `python -m http.server` is the usual one — lets Chrome serve the
@@ -269,14 +308,29 @@ In the profile's `cordis.patch.yml`:
 - id: dsh-agent-browser
   name: dsh-agent-browser
   config:
-    # Register browser_eval. It runs arbitrary script in the page, so it stays
-    # off unless a deployment opts in.
+    # Allow browser_eval to run script in the page. The TOOL is always
+    # registered; with this false it refuses and explains how to enable it.
     enableEval: false
     # Character budget for browser_read text/html.
     maxReadChars: 20000
     # browser_screenshot downscales to at most this width before delivery.
     screenshotMaxWidth: 1568
 ```
+
+`browser_eval` is deliberately **visible either way**. Registering it only when
+enabled was the earlier design, on the reasoning that a deployment should not
+advertise a capability it has not accepted. Two independent agent reports showed
+what that costs: needing layout geometry (`getBoundingClientRect`, `scrollHeight`,
+`getComputedStyle`) — exactly what eval is for — neither agent could see the
+capability existed, and each rebuilt the same workaround instead, writing
+same-origin iframe probe pages into the project under test. That polluted a
+repository whose `.gitignore` did not cover them and travelled into the build
+output; one round shipped three bugs of its own, including a scrollbar artifact
+that nearly produced a false layout conclusion. An invisible capability is not a
+safe one, it is an unguessable one — so the tool is registered, refuses when the
+switch is off, and names the switch. Refusing grants nothing: the guard that
+closes the `cordis_inspect_query` route to the provider's `eval` method is
+unchanged, so the switch remains a real boundary rather than a hint.
 
 The Inspect channel also has a process-wide client-query timeout, defaulting to
 10 s. A slow page can exceed it, so raise it on the runner that owns the
@@ -295,7 +349,15 @@ slow page answers "did not answer within 6s" instead of turning into an opaque
 transport timeout. Both cover the whole call, not one step of it:
 `browser_act { action: "wait" }`, navigation settles and the pause after a click
 all draw from the same deadline, so no single call can outlast the caller.
-Raise `clientInspectTimeoutMs` (above) if you want a longer ceiling to spend — the
+
+Be precise about what that budget buys, because a report read it as the total
+wait: it bounds how long the **browser** waits before giving up. It does not
+bound the call. When the Client reports a failure, the registry records it as a
+diagnostic and keeps waiting for a success, so the caller still waits out
+`clientInspectTimeoutMs`. That is why a failure can show both `timed out after
+60000ms` and `did not answer within 13s` — the first is the channel, the second is
+this plugin, and only the second is a diagnosis. Raise
+`clientInspectTimeoutMs` (above) if you want a longer ceiling to spend; the
 plugin's budgets stay as they are, since they are not configurable today.
 
 ## How it works
@@ -557,7 +619,11 @@ Optional — the defaults are safe. In
 - id: dsh-agent-browser
   name: dsh-agent-browser
   config:
-    enableEval: false        # leave false unless you want the model to run JS in pages
+    # Allow script execution in the page. The tool is always listed; with this
+    # false it refuses and tells the model how to enable it. Turn it on if you
+    # do layout verification — measuring geometry any other way means injecting
+    # probe pages into the project under test.
+    enableEval: false
     maxReadChars: 20000
     screenshotMaxWidth: 1568
 ```
@@ -577,7 +643,8 @@ restart.
 
 ### Where the controls appear
 
-- The model gains seven tools (eight with `enableEval: true`).
+- The model gains eight tools (`browser_eval` is always listed; it refuses until
+  `enableEval: true`).
 - **Right-click a browser tab** for *Viewport size* (fit / phone / tablet /
   desktop / custom).
 - **Settings → General → Browser viewport** sets the default for new tabs.
@@ -672,7 +739,7 @@ manager would try to replace the link and pnpm can fail with
 
 ## Tests
 
-Ten suites, no test framework — plain Node scripts that exit non-zero on
+Eleven suites, no test framework — plain Node scripts that exit non-zero on
 failure. The executable is located automatically (a sibling install, or
 `DeepSeek Harness.exe` somewhere up the tree); normally you do not pass it.
 
@@ -708,7 +775,8 @@ node test/run-all.cjs --offline
 | `viewport-controller-check` | Which element gets which inline style, centring, fallbacks, unmounted tabs. |
 | `contract-check` | Every tool's **real** result shape — success and degradation — through the registry's own lossless-JSON detach and output-schema validation, plus the `truncated` flag's semantics and active-tab reporting. |
 | `session-scope-check` | That opening a tab is addressed to the **calling** Session, not the on-screen one, and that a tab landing in another Conversation is reported as such rather than as merely unmounted. |
-| `resilience-check` | That a stalled page is bounded by the plugin budget instead of stalling the call; that a viewport change is confirmed rather than assumed; that a failed load is reported as failed and refused by the screenshot path; that a wedged, unscriptable page is not captured as a blank image; that a tab listing shares one deadline; and that reload/close actually work. A watchdog turns a hang into a failure — without it, removing the bound under test would make the process exit 0 and look green. |
+| `resilience-check` | That a stalled page is bounded by the plugin budget instead of stalling the call; that a viewport change is confirmed rather than assumed; that a failed load is reported as failed and refused by the screenshot path; that a wedged, unscriptable page is not captured as a blank image; that a failed capture diagnoses visibility (hidden Conversation, collapsed Sidebar, another tab drawn, or visibility ruled out) and never blames reachability or prescribes reload; that a tab listing shares one deadline; and that reload/close actually work. A watchdog turns a hang into a failure — without it, removing the bound under test would make the process exit 0 and look green. |
+| `host-error-check` | How the Host explains a failed Client query, in pure Node so it runs everywhere: a provider that ANSWERED keeps its own diagnosis and is not called unreachable or blamed on the Session kind; a genuinely absent provider/page/method keeps the reachability explanation; a silent timeout names the visibility possibility without asserting it; and a cancelled call or a schema rejection passes through untouched. |
 
 Three of these must run under the packaged executable in Node mode, because they
 import the real validators out of `app.asar`; `run-all.cjs` does that for you.
@@ -725,9 +793,19 @@ success: an unbounded guest call that stalled for a fixed 60 s, a viewport chang
 reported before the page had reflowed, and a failed load that read as healthy
 because Electron's URL overrode the page's.
 
+Two of those are worth naming because the wording itself was the defect. A failed
+capture was explained as "the browser is not reachable from this Session — use a
+Desktop Session", which was false on both counts in the report that produced it
+(the user was on a Desktop Session, and `browser_read` worked against the same tab
+throughout), and it buried the provider's own diagnosis. And it prescribed
+reloading, which a later report measured as having no effect — a hidden tab is not
+composited, and reloading cannot change that.
+
 `test/mutation-probe.cjs` guards the guards. It reintroduces each original defect
-in turn and fails if `resilience-check` does not go red, so a check that has
-quietly stopped covering its defect cannot pass unnoticed:
+in turn and fails if the check that should catch it does not go red, so a check
+that has quietly stopped covering its defect cannot pass unnoticed. It mutates
+both halves — the Client half owns capture and visibility, the Host half owns how
+a failure is explained:
 
 ```bash
 node test/mutation-probe.cjs
@@ -744,8 +822,9 @@ screenshot branches directly so their shapes cannot drift.
 
 ## Model experience
 
-Eight tools enter the model-facing tool list (seven with `enableEval: false`). The
-tool schemas are stable; results are lossless JSON. Screenshots add one image
+Eight tools enter the model-facing tool list, always — `browser_eval` included,
+refusing when `enableEval` is off rather than being absent (see *Configuration*).
+The tool schemas are stable; results are lossless JSON. Screenshots add one image
 block per call, so they consume image tokens — prefer `browser_read` for text
 and reach for `browser_screenshot` when layout or visual state matters.
 

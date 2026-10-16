@@ -135,11 +135,85 @@ function makeGuest(options = {}) {
   return guest
 }
 
+/** A DOM element stub with an attribute set and a real parent link. */
+function makeNode(dataset = {}) {
+  const attributes = new Set()
+  return {
+    dataset,
+    parentElement: null,
+    guest: null,
+    hasAttribute: (name) => attributes.has(name),
+    setAttribute: (name) => attributes.add(name),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    closest: () => null,
+  }
+}
+
+/**
+ * A Sidebar DOM for one Session, mirroring the two nesting levels the real shell
+ * uses.
+ *
+ * The diagnosis depends on this shape, and the shape is easy to get wrong: the
+ * OUTER per-Conversation wrapper carries `data-sidebar-right-session` and goes
+ * `hidden` when its Conversation is not on screen, while the INNER panel carries
+ * `data-sidebar-right-session` too and is the element carrying
+ * `data-sidebar-right-open`. `document.querySelector` returns the outer one, so a
+ * diagnosis reading the open flag from there would always say "collapsed".
+ * @param options - `{ sessionId, tabIds, selectedTabId, hidden, expanded, withPane }`.
+ * @returns the assembled stub tree.
+ */
+function makeSidebarDom(options = {}) {
+  const sessionId = options.sessionId ?? 's1'
+  const tabIds = options.tabIds ?? ['tab1']
+  const selectedTabId = options.selectedTabId ?? tabIds[0]
+  const withPane = options.withPane ?? true
+
+  const outer = makeNode({ sidebarRightSession: sessionId })
+  if (options.hidden === true) outer.setAttribute('hidden')
+  const panel = makeNode({ sidebarRightSession: sessionId })
+  panel.setAttribute('data-sidebar-right-panel')
+  if (options.expanded !== false) panel.setAttribute('data-sidebar-right-open')
+  panel.parentElement = outer
+  const pane = makeNode({})
+  pane.parentElement = panel
+
+  const selectedTitle = makeNode({})
+  selectedTitle.parentElement = pane
+
+  const wrappers = tabIds.map((tabId) => {
+    const wrapper = makeNode({ sidebarRightTab: tabId })
+    wrapper.parentElement = pane
+    wrapper.closest = (selector) => {
+      if (selector === '[data-sidebar-right-session]') return outer
+      if (selector === '[data-sidebar-right-panel]') return panel
+      if (selector.includes('data-dockkit-pane')) return withPane ? pane : null
+      return null
+    }
+    // The guest lookup path the driver uses.
+    wrapper.querySelector = (selector) => (selector.includes('webview') ? wrapper.guest : null)
+    return wrapper
+  })
+
+  outer.querySelectorAll = (selector) => (selector === '[data-sidebar-right-tab]' ? wrappers : [])
+  if (withPane) {
+    pane.querySelector = (selector) =>
+      selector === '[role="tab"][aria-selected="true"]' ? selectedTitle : null
+    selectedTitle.closest = (selector) =>
+      selector === '[data-sidebar-right-tab]'
+        ? wrappers.find((w) => w.dataset.sidebarRightTab === selectedTabId) ?? null
+        : null
+  }
+
+  return { sessionId, outer, panel, pane, wrappers }
+}
+
 /** One Session's Sidebar root, carrying its browser tabs. */
 function makeRoot(sessionId, entries) {
   const root = {
     dataset: { sidebarRightSession: sessionId },
     wrappers: [],
+    hasAttribute: () => false,
     querySelectorAll: (selector) => (selector === '[data-sidebar-right-tab]' ? root.wrappers : []),
   }
   for (const entry of entries) {
@@ -221,7 +295,12 @@ function loadBundle(world) {
     document: {
       querySelector: (selector) => {
         const match = /^\[data-sidebar-right-session="([^"]*)"\]$/.exec(selector)
-        if (match) return world.roots.get(match[1]) ?? null
+        if (match) {
+          // A world may supply a richer Sidebar DOM than the flat root map, which
+          // the visibility diagnosis needs (it walks real ancestors).
+          if (world.sidebar?.sessionId === match[1]) return world.sidebar.outer
+          return world.roots.get(match[1]) ?? null
+        }
         return null
       },
       querySelectorAll: () => [],
@@ -331,8 +410,13 @@ async function main() {
       { elapsed },
     )
     check(
-      'the failure says the page did not answer and suggests a way out',
-      /did not answer/i.test(String(error?.message)) && /reload/.test(String(error?.message)),
+      // The message must state the fact and must NOT prescribe reloading: a
+      // later report measured reload having no effect on this failure (it cannot
+      // change whether a tab is being drawn), so prescribing it cost the caller a
+      // retry that could not work. Guarding the ABSENCE keeps it from creeping
+      // back in as helpful-sounding advice.
+      'the failure says the page did not answer, without prescribing reload',
+      /did not answer/i.test(String(error?.message)) && !/reload/.test(String(error?.message)),
       String(error?.message),
     )
   }
@@ -612,6 +696,127 @@ async function main() {
       'the refusal explains the page did not answer',
       /did not answer/.test(String(error?.message)) && /blank/.test(String(error?.message)),
       String(error?.message),
+    )
+  }
+
+  // ---------------------------------------------------------------------
+  // 5b. A capture that fails must say WHY, and the reason that actually
+  // explains the reported failures is visibility: `keepMounted` keeps every
+  // visited tab in the DOM, but only the selected tab of the on-screen pane is
+  // drawn, and a hidden guest is not composited. The caller cannot see any of
+  // that from the tool results, and the old message blamed reachability and
+  // prescribed a reload that a live report measured as ineffective.
+  // ---------------------------------------------------------------------
+  const captureFailureCases = [
+    {
+      label: 'the Conversation is not on screen',
+      dom: { hidden: true },
+      expect: /hidden/,
+    },
+    {
+      label: 'the right Sidebar is collapsed',
+      dom: { expanded: false },
+      expect: /not expanded/,
+    },
+    {
+      label: 'another tab is the one being drawn',
+      dom: { tabIds: ['tab1', 'tab2'], selectedTabId: 'tab2' },
+      expect: /not the one being shown.*tab2/,
+    },
+    {
+      label: 'visibility is ruled OUT when the tab really is the drawn one',
+      dom: {},
+      expect: /visibility does not explain it/,
+    },
+  ]
+  for (const scenario of captureFailureCases) {
+    const guest = makeGuest({})
+    guest.capturePage = async () => {
+      throw new Error('Error invoking remote method GUEST_VIEW_MANAGER_CALL: UnknownVizError')
+    }
+    const sidebar = makeSidebarDom({ sessionId: SESSION, tabIds: ['tab1'], ...scenario.dom })
+    sidebar.wrappers[0].guest = guest
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    world.sidebar = sidebar
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 500
+    bundle.budgets.screenshot = 4000
+
+    let error
+    try {
+      await bundle.provider.query('screenshot', {}, { sessionId: SESSION })
+    } catch (thrown) {
+      error = thrown
+    }
+    const message = String(error?.message)
+    check(`a failed capture diagnoses visibility: ${scenario.label}`, scenario.expect.test(message), message)
+    check(
+      `the diagnosis keeps the provider reason: ${scenario.label}`,
+      /UnknownVizError/.test(message),
+      message,
+    )
+    // The two things the old wording got wrong, both reported from live use.
+    check(
+      `a failed capture does not blame reachability: ${scenario.label}`,
+      !/not reachable/.test(message) && !/Use a Desktop Session/.test(message),
+      message,
+    )
+    check(
+      `a failed capture does not prescribe reload: ${scenario.label}`,
+      !/reload/.test(message),
+      message,
+    )
+  }
+
+  // A DOM that exposes none of the visibility signals must produce NO diagnosis
+  // rather than a false reassurance: "visibility does not explain it" is a claim,
+  // and it may only be made from evidence. The guest stays mounted here — the
+  // point is a shell whose attributes the diagnosis cannot read, not an
+  // unreachable tab.
+  {
+    const guest = makeGuest({})
+    guest.capturePage = async () => {
+      throw new Error('UnknownVizError')
+    }
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    world.sidebar = makeSidebarDom({ sessionId: SESSION, tabIds: ['tab1'] })
+    // The guest must live on the SIDEBAR DOM's wrapper: that tree is what
+    // `document.querySelector` resolves to, so an unattached guest reads as an
+    // unmounted tab and the call never reaches the capture path at all.
+    world.sidebar.wrappers[0].guest = guest
+    // A shell that renamed its attributes: the panel selector misses entirely and
+    // no selected-tab marker exists, so every signal the diagnosis looks for is
+    // absent. Note it is not enough to make `hasAttribute` return false — a panel
+    // that genuinely lacks the open flag MEANS collapsed, so the honest way to
+    // model "cannot tell" is for the selectors to find nothing.
+    world.sidebar.outer.hasAttribute = () => false
+    world.sidebar.pane.querySelector = () => null
+    for (const wrapper of world.sidebar.wrappers) {
+      wrapper.closest = (selector) => {
+        if (selector === '[data-sidebar-right-session]') return world.sidebar.outer
+        return null
+      }
+    }
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 500
+    bundle.budgets.screenshot = 4000
+    let error
+    try {
+      await bundle.provider.query('screenshot', {}, { sessionId: SESSION })
+    } catch (thrown) {
+      error = thrown
+    }
+    const message = String(error?.message)
+    check(
+      'no visibility claim is made when the DOM cannot support one',
+      !/visibility does not explain it/.test(message) && !/not being drawn/.test(message),
+      message,
+    )
+    check('the provider reason still survives', /UnknownVizError/.test(message), message)
+    check(
+      'a failed capture still avoids blaming reachability without a diagnosis',
+      !/not reachable/.test(message) && !/Use a Desktop Session/.test(message),
+      message,
     )
   }
 

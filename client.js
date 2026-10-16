@@ -167,8 +167,7 @@ window.__ModuleLoader__.load({
               () => {
                 const error = new Error(
                   `${what} did not answer within ${Math.round(budget / 1000)}s. The page may be busy, ` +
-                    'or its renderer may have stalled; retry, or reload the tab with ' +
-                    "browser_act { action: 'reload' } and try again.",
+                    'or its renderer may have stalled.',
                 )
                 // Tagged so callers can tell "we ran out of time" apart from
                 // "the page threw", and report the former un-wrapped.
@@ -817,7 +816,12 @@ window.__ModuleLoader__.load({
           clearCenteringStyles(container)
           guest.style.cssText = ''
           // No fixed target in auto: the page simply takes the column's width.
-          entry.frame = { preset: 'auto', scale: 1, viewportWidth: Math.round(available) || undefined }
+          entry.frame = {
+            preset: 'auto',
+            scale: 1,
+            viewportWidth: Math.round(available) || undefined,
+            columnWidth: Math.round(available) || undefined,
+          }
         } else {
           const placement = computePlacement(target.width, target.height, available, availableHeight)
           const { scale, offsetX, offsetY } = placement
@@ -858,6 +862,13 @@ window.__ModuleLoader__.load({
             scale,
             viewportWidth: target.width,
             viewportHeight: target.height,
+            // What `scale` is a ratio OF. It is the Sidebar column's own width,
+            // not the delivered image: `scale === columnWidth / viewportWidth`.
+            // A report tried to use `scale × pageWidth` for pixel conversion and
+            // got the same number (767) for two different viewports, because that
+            // product is just the column width — which is only constant while the
+            // column is. Stating it removes the guesswork.
+            columnWidth: Math.round(available) || undefined,
             fellBack: target.fellBack,
             offsetX: Math.round(offsetX),
             offsetY: Math.round(offsetY),
@@ -966,7 +977,12 @@ window.__ModuleLoader__.load({
           // What we draw: the unscaled target and the shrink we applied.
           targetWidth: frame?.viewportWidth,
           targetHeight: frame?.viewportHeight,
+          // `scale` is columnWidth / viewportWidth — the ratio the display is
+          // shrunk by inside the Sidebar column, NOT a ratio against the
+          // delivered image. Both are reported so pixel conversion does not have
+          // to reverse-engineer either one.
           scale: frame?.scale,
+          columnWidth: frame?.columnWidth,
           mounted: guest !== undefined,
         })
       }
@@ -1205,6 +1221,81 @@ window.__ModuleLoader__.load({
           `this Session has ${guests.size} mounted browser tabs, so tabId is required. ` +
             'Call browser_tabs to choose one.',
         )
+      }
+
+      /**
+       * Report whether a tab is actually being rendered, from the host DOM.
+       *
+       * This exists because a screenshot can fail for a reason the model cannot
+       * otherwise see. `keepMounted` keeps every visited browser tab in the DOM
+       * so the tools can reach one the user is not looking at — but only the
+       * SELECTED tab of the on-screen pane is displayed, and a hidden guest is
+       * not composited. `findGuest` matches by attribute and cannot tell the
+       * difference, so a capture aimed at a hidden tab waits for a frame that
+       * never comes. From the outside that looks like "the browser is not
+       * reachable", which is both wrong and unactionable: `browser_read` still
+       * works against the same tab, and reloading does not change visibility.
+       *
+       * Every probe is best-effort. This runs while composing a FAILURE message,
+       * so a diagnostic that threw would replace the real error with its own.
+       * @param sessionId - owning Session.
+       * @param tabId - target tab.
+       * @returns a short description, or undefined when nothing can be told.
+       */
+      visibleDiagnosis(sessionId, tabId) {
+        try {
+          const escape = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape : (value) => value
+          const root = document.querySelector(`[data-sidebar-right-session="${escape(sessionId)}"]`)
+          if (root === null || root === undefined) {
+            return 'the Sidebar for this Conversation is not in the page at all'
+          }
+          const wrapper = [...root.querySelectorAll('[data-sidebar-right-tab]')].find(
+            (candidate) => candidate.dataset?.sidebarRightTab === tabId,
+          )
+          if (wrapper === undefined) {
+            return 'this tab has no element in the page'
+          }
+          // Walk the real ancestor chain rather than assuming which element
+          // carries which attribute. Two different elements carry
+          // `data-sidebar-right-session` — the outer per-Conversation wrapper
+          // (which goes `hidden` for a Conversation that is not on screen) and the
+          // inner panel — so `querySelector` returning "the" session element is
+          // not a safe assumption to build a diagnosis on.
+          for (let node = wrapper; node !== null && node !== undefined; node = node.parentElement ?? null) {
+            if (node.hasAttribute?.('hidden') === true) {
+              return 'an ancestor of this tab is hidden, so it is not being drawn'
+            }
+          }
+          const panel = wrapper.closest?.('[data-sidebar-right-panel]')
+          if (panel !== null && panel !== undefined && panel.hasAttribute?.('data-sidebar-right-open') !== true) {
+            return 'the right Sidebar is not expanded, so this tab is not being drawn'
+          }
+          // The selected tab is the one the pane shows; the rest keep their DOM
+          // but are not on screen. `role=tab[aria-selected]` is what the docking
+          // kit maintains, and it is the only reliable statement of "drawn".
+          const pane = wrapper.closest?.('[data-dockkit-pane], [data-dockkit-float]')
+          let sawSelection = false
+          if (pane !== null && pane !== undefined) {
+            const selected = pane.querySelector?.('[role="tab"][aria-selected="true"]')
+            if (selected !== null && selected !== undefined) {
+              sawSelection = true
+              const selectedWrapper = selected.closest?.('[data-sidebar-right-tab]')
+              const selectedId = selectedWrapper?.dataset?.sidebarRightTab
+              if (typeof selectedId === 'string' && selectedId !== tabId) {
+                return `this tab is not the one being shown (the pane is displaying "${selectedId}")`
+              }
+            }
+          }
+          // "Ruled out" is a claim, so it is only made from evidence: a caller
+          // whose DOM exposes none of these signals (a stub, or a future shell
+          // that renames them) gets no diagnosis rather than a false reassurance.
+          if (panel !== null && panel !== undefined && sawSelection) {
+            return 'this tab is the one being drawn and the Sidebar is open, so visibility does not explain it'
+          }
+          return undefined
+        } catch {
+          return undefined
+        }
       }
 
       /**
@@ -1669,19 +1760,42 @@ window.__ModuleLoader__.load({
         // path can never set. Refusing is the honest answer: the page could not
         // be verified, so nothing can be promised about what the image shows.
         if (before.unverified) {
+          const visibility = this.visibleDiagnosis(sessionId, tabId)
           throw new Error(
             'the page did not answer, so a screenshot could not be verified. A capture now would be a ' +
               'blank or stale surface rather than the site — which is exactly how a failed page gets ' +
-              'mistaken for a page that "did not render". The tab is either mid-navigation or its ' +
-              "renderer has stalled. Wait for it to settle, or reload it with " +
-              "browser_act { action: 'reload' }, then retry.",
+              'mistaken for a page that "did not render".' +
+              (visibility === undefined ? '' : ` ${visibility}.`) +
+              ' Click this tab in the right Sidebar so it is the one being drawn (a hidden tab is not ' +
+              'composited), wait for the page to settle, then retry.',
           )
         }
 
         if (typeof guest.capturePage !== 'function') {
           throw new Error('this carrier cannot capture the page; screenshots need the Desktop webview.')
         }
-        let image = await raceBudget(guest.capturePage(), budgetLeft(deadline), 'the screenshot')
+        // Capture, and on failure say WHY in terms the caller can act on.
+        //
+        // Measured live: a capture can fail while the same tab reads perfectly
+        // well, which rules out "the browser is unreachable" — the old wording —
+        // and rules out reloading, which the old wording also suggested and which
+        // cannot change whether a tab is being drawn. A hidden guest is not
+        // composited, so the honest diagnosis is usually about visibility, which
+        // is exactly what the caller cannot see from the tool results.
+        let image
+        try {
+          image = await raceBudget(guest.capturePage(), budgetLeft(deadline), 'the screenshot')
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          const visibility = this.visibleDiagnosis(sessionId, tabId)
+          throw new Error(
+            `the screenshot failed: ${reason}` +
+              (visibility === undefined ? '' : ` — ${visibility}`) +
+              '. The page was readable at the same moment, so the browser itself is fine: this is ' +
+              'the capture path. Click this tab in the right Sidebar so it is the one being drawn ' +
+              '(a hidden tab is not composited), or capture a different tab.',
+          )
+        }
         const original = image.getSize()
         if (original.width > maxWidth) image = image.resize({ width: maxWidth })
         const dataUrl = image.toDataURL()
@@ -1692,6 +1806,13 @@ window.__ModuleLoader__.load({
           tabId,
           mediaType: 'image/png',
           base64: dataUrl.slice(comma + 1),
+          // These are the DELIVERED IMAGE's pixel dimensions, nothing else. They
+          // are capped by `maxWidth` (1568 by default), so when the captured
+          // width exceeds that they describe the downscaled copy rather than the
+          // viewport. A report read them as a fixed 16:10 output canvas because
+          // two different presets both happened to be 16:10 and both exceeded the
+          // cap, producing 1568×980 twice; the cap is the real explanation, and
+          // `pageWidth`/`pageHeight` are the fields that describe the viewport.
           width: size.width,
           height: size.height,
           ...(await this.describe(guest, budgetLeft(deadline))),
@@ -1701,7 +1822,10 @@ window.__ModuleLoader__.load({
                 preset: frame.preset,
                 pageWidth: frame.pageWidth,
                 pageHeight: frame.pageHeight,
+                // `scale` and its basis travel together, so a caller never has to
+                // guess what the ratio is against: scale === columnWidth / pageWidth.
                 scale: frame.scale,
+                ...(frame.columnWidth === undefined ? {} : { columnWidth: frame.columnWidth }),
                 // Only meaningful when a size was applied: it says whether the
                 // page was observed laying out at that size before capture.
                 ...(frame.confirmed === undefined ? {} : { confirmed: frame.confirmed }),

@@ -54,25 +54,51 @@ async function callProvider(ctx, agent, signal, method, input) {
     return await registry.query('client', PROVIDER, method, input, agent, signal)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    // The structural "this Session cannot reach a page at all" diagnostics the
-    // registry actually produces, not just the ones an older build emitted:
-    //   Client Cordis inspect provider "AgentBrowser" is not registered
-    //   Client inspect query AgentBrowser.read has no connected Harness page. …
-    //   Client inspect query AgentBrowser.read timed out after 10000ms. …
-    //   Client inspect provider "AgentBrowser" has no method "read"
-    // Two classes are deliberately NOT matched, because "not reachable" would be
-    // a false explanation for them and the registry's own text is already exact:
-    //   `was cancelled`      — the tool call ended; nothing was unreachable.
-    //   `rejected input: …`  — the two halves disagree about an input schema, so
-    //                          no retry or Session change can help.
+    // A Client query can fail in three structurally different ways, and saying
+    // "unreachable" for all of them was actively misleading: a reported session
+    // showed the browser working perfectly (`browser_read` succeeded throughout)
+    // while every screenshot failure was explained as the browser being
+    // unreachable and the user being on the wrong kind of Session. That text
+    // buried the provider's own diagnosis, which was the only thing worth
+    // reading. Order matters below: a provider answer ALSO carries the channel's
+    // `timed out` wrapper, so it has to be recognised before that wrapper.
+    //
+    // 1. The provider ANSWERED and reported a failure. Its message is the truth.
+    //    The Inspect channel only delivers it late: when the Client reports a
+    //    failure, the registry keeps it as a diagnostic and does NOT settle the
+    //    query, so the caller waits out the channel's full timeout before being
+    //    told. Both numbers in that wrapper are real and neither is the cause.
+    const answered = /Client failure:\s*([\s\S]+)$/.exec(message)
+    if (answered !== null) {
+      const diagnosis = answered[1].trim().replace(/^provider-error:\s*/i, '')
+      throw new Error(
+        `the in-app browser failed to run "${method}": ${diagnosis} ` +
+          `(the Inspect channel wrapped that as: ${message})`,
+      )
+    }
+    // 2. Nothing answered at all: no provider, no page, no such method. Here
+    //    "unreachable" is exactly right, and so is pointing at the Session.
     if (
-      /is not registered|unavailable|provider-missing|timed out|no catalogued|has no connected|has no method/i.test(
+      /is not registered|unavailable|provider-missing|no catalogued|has no connected|has no method/i.test(
         message,
       )
     ) {
       throw new Error(
         `the in-app browser is not reachable from this Session: ${message}. ` +
           'Use a Desktop Session and make sure the right Sidebar browser is available, then retry.',
+      )
+    }
+    // 3. The channel timed out with NOTHING from the provider. Whether the page
+    //    is gone or merely not being drawn cannot be told from here, so this
+    //    keeps the reachability framing (which is what a silent provider means)
+    //    but stops asserting the Desktop cause, and names the other possibility
+    //    instead of guessing between them.
+    if (/timed out/i.test(message)) {
+      throw new Error(
+        `the in-app browser is not reachable from this Session: ${message} ` +
+          'Nothing at all was reported from the page. Check that this Conversation is the one on ' +
+          'screen and that its right Sidebar is open — a tab that is not the one being drawn is not ' +
+          'composited, and a capture against it waits for a frame that never arrives. Then retry.',
       )
     }
     throw error
@@ -406,12 +432,18 @@ function apply(ctx, config) {
                 // Declared because a required field must appear in properties,
                 // and present so the caller can see the check was made.
                 failed: { type: 'boolean' },
+                // The DELIVERED image's pixels, capped by maxWidth — not the
+                // viewport. `pageWidth`/`pageHeight` describe the viewport.
                 width: { type: 'number' },
                 height: { type: 'number' },
                 preset: { type: 'string' },
                 pageWidth: { type: 'number' },
                 pageHeight: { type: 'number' },
+                // scale === columnWidth / pageWidth: the display shrink inside the
+                // Sidebar column, with its basis stated so neither has to be
+                // reverse-engineered for pixel conversion.
                 scale: { type: 'number' },
+                columnWidth: { type: 'number' },
                 // Present only when a preset was applied, so it stays optional.
                 confirmed: { type: 'boolean' },
               },
@@ -555,7 +587,10 @@ function apply(ctx, config) {
                 pageHeight: { type: 'number' },
                 targetWidth: { type: 'number' },
                 targetHeight: { type: 'number' },
+                // scale === columnWidth / pageWidth; both are reported so a
+                // caller never has to guess what the ratio is against.
                 scale: { type: 'number' },
+                columnWidth: { type: 'number' },
                 custom: {
                   type: 'object',
                   properties: { width: { type: 'number' }, height: { type: 'number' } },
@@ -619,50 +654,74 @@ function apply(ctx, config) {
       'dsh-agent-browser: browser_close',
     )
 
-    // `browser_eval` runs arbitrary script in the page. It is off by default and
-    // only registered when the profile turns it on, so the tool list does not
-    // advertise a capability the deployment has not accepted.
-    if (settings.enableEval === true) {
-      scope.effect(
-        () =>
-          tools.register({
-            name: 'browser_eval',
-            description:
-              'Evaluate JavaScript inside the in-app browser page and return the JSON-serializable result. An expression (for example `document.title`, or an IIFE) returns its value; a statement body runs and returns null unless it explicitly `return`s a value. Use it for precise inspection the other tools do not cover. This executes arbitrary script in the page.',
-            parameters: {
+    // `browser_eval` runs arbitrary script in the page, so it stays off unless a
+    // deployment opts in — but the TOOL is registered either way, and when the
+    // switch is off it refuses instead of being absent.
+    //
+    // Registering it only when enabled was the earlier design, justified as "do
+    // not advertise a capability the deployment has not accepted". Two separate
+    // agent reports show what that costs: needing to measure layout geometry
+    // (`getBoundingClientRect`, `scrollHeight`, `getComputedStyle`) — precisely
+    // what eval exists for — neither agent could see the capability at all, and
+    // each rebuilt the same workaround instead: same-origin iframe probe pages
+    // written into the user's `public/` directory. That is strictly worse than
+    // what the switch was protecting against. The probes polluted a repository
+    // whose `.gitignore` did not cover them, travelled into the build output, and
+    // one round shipped three bugs of its own, including a scrollbar artifact
+    // that nearly produced a false layout conclusion.
+    //
+    // An invisible capability is not a safe capability, it is an unguessable one.
+    // Refusing teaches the model that the capability exists and how to turn it on,
+    // which is a decision for the user to make knowingly — and refusal grants
+    // nothing: the guard below still closes the `cordis_inspect_query` route.
+    const evalEnabled = settings.enableEval === true
+    scope.effect(
+      () =>
+        tools.register({
+          name: 'browser_eval',
+          description: evalEnabled
+            ? 'Evaluate JavaScript inside the in-app browser page and return the JSON-serializable result. An expression (for example `document.title`, or an IIFE) returns its value; a statement body runs and returns null unless it explicitly `return`s a value. Use it for precise inspection the other tools do not cover — layout geometry (`getBoundingClientRect`, `scrollHeight`, `getComputedStyle`) is the common case and is unreachable any other way. This executes arbitrary script in the page.'
+            : 'Evaluate JavaScript inside the in-app browser page and return the JSON-serializable result, for precise inspection the other tools do not cover (layout geometry such as `getBoundingClientRect`, `scrollHeight` and `getComputedStyle` is the common case). DISABLED in this deployment: calling it explains how to turn it on. Do not work around it by injecting probe pages into the project being tested.',
+          parameters: {
+            type: 'object',
+            properties: {
+              code: { type: 'string', description: 'Expression or statements to evaluate in the page.' },
+              tabId: TAB_ID_PARAM,
+            },
+            required: ['code'],
+            additionalProperties: false,
+          },
+          output: {
+            schema: {
               type: 'object',
               properties: {
-                code: { type: 'string', description: 'Expression or statements to evaluate in the page.' },
-                tabId: TAB_ID_PARAM,
+                tabId: { type: 'string' },
+                value: {},
+                kind: { type: 'string' },
+                url: { type: 'string' },
+                title: { type: 'string' },
               },
-              required: ['code'],
-              additionalProperties: false,
+              required: ['tabId'],
+              additionalProperties: true,
             },
-            output: {
-              schema: {
-                type: 'object',
-                properties: {
-                  tabId: { type: 'string' },
-                  value: {},
-                  kind: { type: 'string' },
-                  url: { type: 'string' },
-                  title: { type: 'string' },
-                },
-                required: ['tabId'],
-                additionalProperties: true,
-              },
-              render: renderResult('Browser eval'),
-            },
-            presentCall: presentCall('Evaluate in browser page'),
-            async execute(args, exec) {
-              const input = { code: args.code }
-              if (typeof args.tabId === 'string' && args.tabId !== '') input.tabId = args.tabId
-              return await callProvider(ctx, requireAgent(exec), exec.signal, 'eval', input)
-            },
-          }),
-        'dsh-agent-browser: browser_eval',
-      )
-    }
+            render: renderResult('Browser eval'),
+          },
+          presentCall: presentCall('Evaluate in browser page'),
+          async execute(args, exec) {
+            if (!evalEnabled) {
+              throw new Error(
+                'browser_eval is disabled: dsh-agent-browser has enableEval: false. Set it to true in the ' +
+                  'plugin config to allow script execution in the page. Until then, use browser_read (text ' +
+                  'or elements mode) instead of injecting probe pages into the project being tested.',
+              )
+            }
+            const input = { code: args.code }
+            if (typeof args.tabId === 'string' && args.tabId !== '') input.tabId = args.tabId
+            return await callProvider(ctx, requireAgent(exec), exec.signal, 'eval', input)
+          },
+        }),
+      'dsh-agent-browser: browser_eval',
+    )
   })
 }
 

@@ -37,7 +37,7 @@ browser_viewport { preset: "phone" }      -> 以 390×844 重新渲染
 | `browser_navigate` | 在新 tab 打开 URL，或导航已有 tab。 |
 | `browser_viewport` | 读取或修改 tab 的视口尺寸：`auto`、`phone`（390×844）、`tablet`（834×1112）、`desktop`（1280×800）或 `custom`。页面会真实重排，因此站点自身的响应式断点会生效。省略 `tabId` 时作用于唯一已挂载的 tab；读取时总会报告它实际解析到的 tab。`custom` 字段只在 `custom` 预设下出现。 |
 | `browser_close` | 关闭当前 Session 的某个 tab，便于清理排查过程中打开的标签。关闭结果会被确认后才报告成功。 |
-| `browser_eval` | 在页面中执行 JavaScript。**默认关闭**（见配置）。表达式返回其值；语句体返回它显式 `return` 的内容。 |
+| `browser_eval` | 在页面中执行 JavaScript —— 这是读取布局几何（`getBoundingClientRect`、`scrollHeight`、`getComputedStyle`）的唯一途径。**始终列出；在 `enableEval: true` 之前调用即拒绝**（见配置），因此该能力可被发现，而不是无从猜到。表达式返回其值；语句体返回它显式 `return` 的内容。 |
 
 一次典型循环：
 
@@ -92,6 +92,17 @@ browser_close    { tabId: "tab4" }             -> 收尾时清理
 
 每个截图结果都会报告它**实际**截取的尺寸（`preset`、`pageWidth`、`pageHeight`、`scale`），因此截错尺寸在回答中是**可见**的，而不是静默误导。
 
+其中三个字段很容易误读，而有一份报告误读了其中两个，因此值得写清楚：
+
+| 字段 | 它是什么 |
+|---|---|
+| `width` / `height` | **交付图片**的像素，受 `maxWidth`（`screenshotMaxWidth`，默认 1568）截断。既不是视口，也不是固定的输出画布。 |
+| `pageWidth` / `pageHeight` | 页面实际排版的**视口**，单位为 CSS 像素。这才是页面自身 media query 看到的尺寸。 |
+| `scale` | **Sidebar 栏内**的显示缩放比：`scale === columnWidth / pageWidth`。 |
+| `columnWidth` | `scale` 所依据的栏宽，因此换算不必再靠反推。 |
+
+这次误读值得记录，因为它是巧合：两个不同预设（`desktop` 1280×800 与 `custom` 1440×900）都返回了 `1568×980`，看起来就像一个固定的 16:10 画布。实际是两者都恰为 16:10 **且**都超过了 1568 的上限，而上限才是真正的解释 —— `1568×800/1280 = 980`、`1568×900/1440 = 980`。`phone`（390×844）远低于上限，会按自身尺寸交付。同理，`scale × pageWidth` 在两个预设下都得到同一个 767，那只是栏宽，不是图片的换算系数。
+
 <a id="viewport-sizes"></a>
 ## 视口尺寸（手机 / 电脑 / 自定义）
 
@@ -143,13 +154,15 @@ guest 是 Electron `<webview>`，而该元素的盒子**就是**页面的视口�
 
 ## 恢复卡住或陈旧的标签
 
-有两件事出得足够频繁，值得单独说明。
+有三件事出得足够频繁，值得单独说明。
 
-**页面不再响应。**每次 guest 调用都受插件自身预算约束（读取或动作 6 秒，截图 15 秒 —— 截图要强制整页重绘，重页面确实需要更久）。渲染进程卡死时你会得到一句说明，而不是 60 秒的干等：
+**截图失败，但同一页面读取正常。**这是最令人困惑的一种，而诊断现在就在错误信息里。`keepMounted` 让每个访问过的 tab 都留在 DOM 中，使工具能触达你并未查看的那个 —— 但只有**当前被选中的那个** tab 会被绘制，而**隐藏的 guest 不参与合成**。对隐藏 tab 的截图会一直等一个永远不来的帧，这就是为什么失败会「粘住」、为什么 `browser_read` 对同一 tab 仍然正常、以及为什么**重载无效**（它改变不了「这个 tab 是否正在被绘制」）。正确的做法是让该 tab 成为被绘制的那一个：
 
-```
-browser_act { action: "reload" }
-```
+> 在右侧 Sidebar 点击这个 tab，让它成为当前显示的那个，然后重试。
+
+每次截图失败现在都会说明属于哪一种（依据宿主 DOM）：某个祖先被隐藏（该对话不在屏幕上）、侧边栏未展开、正在显示的是另一个 tab（会点名），或者**排除**了可见性 —— 因为该 tab 确实就是被绘制的那个。当 shell 不暴露任何这些信号时，诊断什么都不说，而不是猜测 —— 「排除」这个结论只在有证据时才下。
+
+**页面不再响应。**每次 guest 调用都受插件自身预算约束（读取或动作 6 秒，截图 15 秒 —— 截图要强制整页重绘，重页面确实需要更久）。渲染进程卡死时会得到一句说明，而不是 60 秒的干等。但要说清这个预算买到了什么：它约束的是**浏览器**在放弃前等多久，**不是**整次调用。Inspect 通道有自己的超时，而且当 Client 报告失败时，registry 只把它当作诊断保留、**并不**结算该查询 —— 因此调用方仍要等满 `clientInspectTimeoutMs` 才会被告知。消息里会同时出现两个数字，两者都不是原因；真正该据以行动的是插件给出的那条理由。
 
 **改动看起来没生效。**不发缓存头的开发服务器 —— 常见的是 `python -m http.server` —— 会让 Chrome 以启发式缓存继续端上旧的 CSS 和 JS，于是新文件看起来从没应用过。数字「没有变化」就是征兆：
 
@@ -175,14 +188,16 @@ browser_close { tabId: "tab4" }
 - id: dsh-agent-browser
   name: dsh-agent-browser
   config:
-    # 注册 browser_eval。它会在页面中执行任意脚本，因此除非部署方明确开启，
-    # 否则保持关闭。
+    # 允许 browser_eval 在页面中执行脚本。工具**始终注册**；此处为 false 时
+    # 调用即拒绝，并说明如何开启。
     enableEval: false
     # browser_read 的 text/html 字符预算。
     maxReadChars: 20000
     # browser_screenshot 交付前缩小到的最大宽度。
     screenshotMaxWidth: 1568
 ```
+
+`browser_eval` 刻意**两种情况都可见**。此前的设计是只在开启时注册，理由是「不应向部署宣传它尚未接受的能力」。两份互相独立的 agent 报告说明了这样做的代价：需要布局几何（`getBoundingClientRect`、`scrollHeight`、`getComputedStyle`）—— 恰恰是 eval 存在的意义 —— 两个 agent 都完全看不到这个能力存在，于是各自重建了同一套绕法：把同源 iframe 探针页写进被测项目。那污染了一个 `.gitignore` 并不覆盖它们的仓库，并随构建产物一起发布；其中一轮还自带三个 bug，包括一个差点得出错误版面结论的滚动条假象。**一个不可见的能力不是安全的能力，而是无从猜到的能力** —— 因此工具始终注册、关闭时拒绝、并点名那个开关。拒绝不授予任何东西：关闭 `cordis_inspect_query` 直达 provider `eval` 方法那条路的 guard 没有改动，所以这个开关依然是真正的边界，而不是一句提示。
 
 Inspect 通道还有一个进程级的 client 查询超时，默认 10 秒。较慢的页面可能超时，可在持有该注册表的 runner 上提高：
 
@@ -193,7 +208,9 @@ Inspect 通道还有一个进程级的 client 查询超时，默认 10 秒。较
     clientInspectTimeoutMs: 60000
 ```
 
-每次浏览器调用有自己等待页面的预算 —— 读取或动作 **6 秒**，截图 **15 秒** —— 刻意低于上述默认值，以便较慢的页面回答「6 秒内没有响应」，而不会变成不透明的传输超时。两者都覆盖整次调用，而非其中某一步：`browser_act { action: "wait" }`、导航后的 settle、点击后的停顿都从同一个截止时间中扣除，因此任何单次调用都不会超出调用方。若想要更高的上限，请调高上面的 `clientInspectTimeoutMs` —— 插件自身的预算不可配置。
+每次浏览器调用有自己等待页面的预算 —— 读取或动作 **6 秒**，截图 **15 秒** —— 刻意低于上述默认值，以便较慢的页面回答「6 秒内没有响应」，而不会变成不透明的传输超时。两者都覆盖整次调用，而非其中某一步：`browser_act { action: "wait" }`、导航后的 settle、点击后的停顿都从同一个截止时间中扣除，因此任何单次调用都不会超出调用方。
+
+但要精确说明这个预算买到了什么，因为有一份报告把它读成了总等待时间：它约束的是**浏览器**在放弃前等多久，**并不约束整次调用**。当 Client 报告失败时，registry 把它记录为诊断并继续等待成功，因此调用方仍要等满 `clientInspectTimeoutMs`。这就是为什么一次失败里会同时出现 `timed out after 60000ms` 和 `did not answer within 13s` —— 前者是通道，后者是本插件，而只有后者是诊断。若想要更高的上限，请调高上面的 `clientInspectTimeoutMs`；插件自身的预算不可配置。
 
 ## 实现结构
 
@@ -334,7 +351,7 @@ dsh plugin --profile desktop add 'github:guanhaisen/dsh-agent-browser#v0.1.0'
 
 ### 控件出现的位置
 
-- 模型获得七个工具（`enableEval: true` 时八个）。
+- 模型获得八个工具（`browser_eval` 始终列出；在 `enableEval: true` 之前调用即拒绝）。
 - **右键点击浏览器 tab**，可看到*视口尺寸*（自适应 / 手机 / 平板 / 电脑 / 自定义）。
 - **设置 → 通用 → 浏览器视口**设置新 tab 的默认值。
 - `browser.viewport.cycle` 已注册但**默认不绑定按键**；想要键盘快捷键请到*设置 → 快捷键*绑定。
@@ -408,7 +425,7 @@ dsh plugin --profile desktop remove dsh-agent-browser
 
 ## 测试
 
-十个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
+十一个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
 
 ```bash
 node test/run-all.cjs
@@ -433,19 +450,22 @@ node test/run-all.cjs --offline
 | `schema-check` | 每个工具的原始 JSON Schema 对比真实的 `dsh-tools` 校验器，并断言每个工具的 `required` 字段与其是否接受空调用相符。 |
 | `client-check` | Client provider manifest、`pageCall` 代码生成、在 stub DOM 中的 guest 查找、`getViewport` 的隐式 tab 解析，以及 Web profile 的拒绝行为。 |
 | `page-helpers-check` | 读取 / 点击 / 输入 / 选择 / 拒绝路径，针对 DOM stub 运行。 |
-| `eval-gate-check` | Host 侧的 `enableEval` guard，包括 `cordis_inspect_query` 绕过路径。 |
+| `eval-gate-check` | Host 侧的 `enableEval` guard：`cordis_inspect_query` 绕过路径必须被拒；`browser_eval` 在关闭时仍**注册**但调用即拒绝并说明开关；开启时则确实到达 provider。 |
 | `viewport-check` | 尺寸计算、校验与钳制，以及 `setViewport` 的分发接线。 |
 | `apply-check` | `apply()` 激活与座位注册 —— 这一项失败意味着整个 client 半身失效。 |
 | `viewport-controller-check` | 哪个元素获得哪些内联样式、居中、回退、未挂载的 tab。 |
 | `contract-check` | 每个工具的**真实**结果形状 —— 成功与降级 —— 经过注册表自身的 lossless-JSON detach 与输出 schema 校验，外加 `truncated` 标志语义与活动 tab 报告。 |
 | `session-scope-check` | 打开 tab 时以**发起调用的** Session 为地址，而不是屏幕上显示的那个；以及落进别的对话的 tab 会被如实点名，而不是被说成仅仅「未挂载」。 |
-| `resilience-check` | 卡死的页面会被插件预算兜住而不是拖住整次调用；视口改变是被确认的而不是被假定的；加载失败会被如实报告且被截图路径拒绝；无法执行脚本的卡死页面不会被当作空白图截下来；标签列举共享一个截止时间；reload / close 真的有效。看门狗把「挂住」变成失败 —— 没有它，移除被测的那道界限会让进程以 0 退出，看起来一片绿。 |
+| `resilience-check` | 卡死的页面会被插件预算兜住而不是拖住整次调用；视口改变是被确认的而不是被假定的；加载失败会被如实报告且被截图路径拒绝；无法执行脚本的卡死页面不会被当作空白图截下来；截图失败会诊断可见性（对话不在屏幕上 / 侧边栏未展开 / 正在显示的是另一个 tab / 有证据地排除可见性），且绝不甩锅「不可达」或建议 reload；标签列举共享一个截止时间；reload / close 真的有效。看门狗把「挂住」变成失败 —— 没有它，移除被测的那道界限会让进程以 0 退出，看起来一片绿。 |
+| `host-error-check` | Host 如何解释一次失败的 Client 查询，且是纯 Node 检查因此在任何机器上都跑：**已经答复**的 provider 保留自己的诊断，不被说成「不可达」、也不被归咎于 Session 类型；provider/页面/方法确实缺席时保留「不可达」的解释；静默超时只提出可见性这一**可能性**而不作断言；被取消的调用与 schema 拒绝则原样透出。 |
 
 其中三个必须在打包后的可执行文件里以 Node 模式运行，因为它们从 `app.asar` 导入真实校验器；`run-all.cjs` 会替你处理。
 
 若干断言的存在，是因为曾经出过只在运行时才可见的 bug：遗漏 `shortcuts.register` 的 defaults 会静默让整个 client 半身失效；`jsx(type, props, key)` 把标签当作 React key 会渲染出空白按钮；`Modal` portal 到 kit 的点击穿透边界之外会让菜单自我关闭；视口高度被拉伸会破坏 `100vh`；新 tab 走 on-screen 入口打开，结果落进另一个对话，让那个对话的 agent 去驱动了错误项目的页面；以及一组**把失败伪装成成功**的报告缺陷：无约束的 guest 调用会固定卡满 60 秒、页面尚未重排就报告视口已改、加载失败的页面因为 Electron 的 URL 覆盖了页面的 URL 而看起来健康。
 
-`test/mutation-probe.cjs` 守护这些守护者：它逐个重新引入原始缺陷，如果 `resilience-check` 没有变红就报错，因此某个检查悄悄失去覆盖时无法蒙混过关：
+其中两条值得点名，因为**文案本身就是缺陷**。截图失败曾被解释为「浏览器从本 Session 不可达 —— 请使用 Desktop Session」，而在产生该结论的报告里这两点都不成立（用户就在 Desktop Session 上，且 `browser_read` 对同一 tab 全程正常），它还把 provider 自己的诊断埋掉了。它还建议 reload，而后来的报告实测该做法**无效** —— 隐藏的 tab 不参与合成，reload 改变不了这一点。
+
+`test/mutation-probe.cjs` 守护这些守护者：它逐个重新引入原始缺陷，如果应当抓住它的检查没有变红就报错，因此某个检查悄悄失去覆盖时无法蒙混过关。它会改动两侧源码 —— client 半身负责截图与可见性，host 半身负责如何解释失败：
 
 ```bash
 node test/mutation-probe.cjs
@@ -455,7 +475,7 @@ node test/mutation-probe.cjs
 
 ## 模型体验
 
-八个工具进入模型可见的工具列表（`enableEval: false` 时七个）。工具 schema 稳定；结果是 lossless JSON。截图每次调用会增加一个图片块，因此消耗图片 token —— 文本优先用 `browser_read`，当版面或视觉状态重要时再用 `browser_screenshot`。
+八个工具进入模型可见的工具列表，**始终如此** —— 包括 `browser_eval`：它在 `enableEval` 关闭时拒绝，而不是缺席（见*配置*）。工具 schema 稳定；结果是 lossless JSON。截图每次调用会增加一个图片块，因此消耗图片 token —— 文本优先用 `browser_read`，当版面或视觉状态重要时再用 `browser_screenshot`。
 
 工具结果绝不会在模型需要据以推理的事实位置上给出 `null` 或缺失值：无法交付的截图会在 `note` 中说明，而不是返回不可用的字节；`browser_read` 的 `truncated` 区分“列表撞到了上限”与“隐藏元素被过滤”；`browser_tabs` 会报告每个 tab 的 `carrier`，因此 Web profile 的 tab 是**可见地不可驱动**，而不是看起来根本不存在。
 
