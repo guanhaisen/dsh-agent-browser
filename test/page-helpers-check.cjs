@@ -383,6 +383,163 @@ async function main() {
     )
   }
 
+  // ---------------------------------------------------------------------
+  // wait with a condition.
+  //
+  // This is the capability that did not exist: every wait was a fixed sleep,
+  // because `settle` is driven by Electron's NAVIGATION loading state, which a
+  // single-page app clears as soon as its scripts arrive — long before the
+  // framework has mounted. A report measured the cost of guessing instead: too
+  // short on a slow machine, wasted time on a fast one.
+  // ---------------------------------------------------------------------
+  {
+    // The element appears only after a few polls, which is the case a sleep
+    // cannot express: the page is "loaded" the whole time.
+    let visibleAfter = 2
+    const appearing = makeElement('div', { innerText: 'Ready' })
+    appearing.getClientRects = () => (visibleAfter <= 0 ? [{}] : [])
+    domLookup.querySelector = (selector) => {
+      if (selector.includes('data-sidebar-right-session')) return sessionRoot
+      if (selector === '#go') return button
+      if (selector === '#q') return input
+      if (selector === '#pick') return select
+      if (selector === '#late') {
+        visibleAfter -= 1
+        return appearing
+      }
+      if (selector === '#never') return null
+      if (selector === ':::bad') throw new Error('invalid selector')
+      return null
+    }
+    sandbox.document.querySelector = domLookup.querySelector
+
+    const waited = await provider.query(
+      'act',
+      { action: 'wait', selector: '#late', state: 'visible', timeoutMs: 2000 },
+      { sessionId: 's1' },
+    )
+    check('a condition wait reports that it matched', waited.matched === true, waited)
+    check('the wait reports the state it waited for', waited.state === 'visible', waited)
+    check('the wait reports how long it took', typeof waited.waitedMs === 'number', waited)
+
+    // A condition that never holds must FAIL, not return ok:true — otherwise the
+    // caller reads it as "it is ready now", which is the whole reason to name a
+    // condition in the first place.
+    let miss
+    try {
+      await provider.query(
+        'act',
+        { action: 'wait', selector: '#never', state: 'visible', timeoutMs: 200 },
+        { sessionId: 's1' },
+      )
+    } catch (error) {
+      miss = error
+    }
+    check('a condition that never holds fails instead of reporting success', miss !== undefined, String(miss))
+    check(
+      'the failure names the selector, the state and the elapsed time',
+      /#never/.test(String(miss?.message)) && /visible/.test(String(miss?.message)) && /within/.test(String(miss?.message)),
+      String(miss?.message),
+    )
+
+    // `attached` and `visible` are genuinely different questions, and conflating
+    // them is the documented trap: an element can exist while `display: none`,
+    // which is how a report counted hidden rows as present and concluded a layout
+    // had no overflow.
+    const attachedOnly = makeElement('div', { innerText: 'Hidden but present' })
+    attachedOnly.getClientRects = () => []
+    domLookup.querySelector = (selector) => {
+      if (selector.includes('data-sidebar-right-session')) return sessionRoot
+      if (selector === '#go') return button
+      if (selector === '#q') return input
+      if (selector === '#pick') return select
+      if (selector === '#ghost') return attachedOnly
+      if (selector === ':::bad') throw new Error('invalid selector')
+      return null
+    }
+    sandbox.document.querySelector = domLookup.querySelector
+
+    const attached = await provider.query(
+      'act',
+      { action: 'wait', selector: '#ghost', state: 'attached', timeoutMs: 500 },
+      { sessionId: 's1' },
+    )
+    check('an attached-but-invisible element satisfies state attached', attached.matched === true, attached)
+
+    let notVisible
+    try {
+      await provider.query(
+        'act',
+        { action: 'wait', selector: '#ghost', state: 'visible', timeoutMs: 200 },
+        { sessionId: 's1' },
+      )
+    } catch (error) {
+      notVisible = error
+    }
+    check(
+      'the same element does NOT satisfy state visible',
+      notVisible !== undefined,
+      String(notVisible),
+    )
+
+    // 'hidden' must be satisfied by ABSENT as well as invisible: waiting out a
+    // spinner that gets removed is the common case.
+    const hiddenWait = await provider.query(
+      'act',
+      { action: 'wait', selector: '#never', state: 'hidden', timeoutMs: 500 },
+      { sessionId: 's1' },
+    )
+    check('state hidden is satisfied by an absent element', hiddenWait.matched === true, hiddenWait)
+
+    // An invalid selector is a caller mistake, not a timeout: it must be reported
+    // as such immediately rather than after burning the whole budget and then
+    // blaming the page.
+    let invalid
+    try {
+      await provider.query(
+        'act',
+        { action: 'wait', selector: ':::bad', state: 'visible', timeoutMs: 2000 },
+        { sessionId: 's1' },
+      )
+    } catch (error) {
+      invalid = error
+    }
+    check(
+      'an invalid selector is refused as invalid, not as a timeout',
+      /not valid CSS/.test(String(invalid?.message)),
+      String(invalid?.message),
+    )
+
+    // An unknown state is refused rather than silently treated as the default.
+    let badState
+    try {
+      await provider.query(
+        'act',
+        { action: 'wait', selector: '#go', state: 'sideways', timeoutMs: 200 },
+        { sessionId: 's1' },
+      )
+    } catch (error) {
+      badState = error
+    }
+    check('an unknown state is refused', /unknown wait state/.test(String(badState?.message)), String(badState?.message))
+
+    // The bare sleep must keep working unchanged: a caller that passes only
+    // timeoutMs is not asking for a condition.
+    const slept = await provider.query('act', { action: 'wait', timeoutMs: 10 }, { sessionId: 's1' })
+    check('a wait with no condition still just sleeps', slept.ok === true && slept.matched === undefined, slept)
+
+    domLookup.querySelector = (selector) => {
+      if (selector.includes('data-sidebar-right-session')) return sessionRoot
+      if (selector === '#go') return button
+      if (selector === '#q') return input
+      if (selector === '#pick') return select
+      if (selector === '#missing') return null
+      if (selector === ':::bad') throw new Error('invalid selector')
+      return null
+    }
+    sandbox.document.querySelector = domLookup.querySelector
+  }
+
   console.log(failures === 0 ? '\nALL PAGE HELPER CHECKS PASSED' : `\n${failures} FAILURES`)
   process.exit(failures === 0 ? 0 : 1)
 }

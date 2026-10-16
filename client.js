@@ -273,6 +273,48 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Whether an element is actually being drawn.
+     *
+     * Shared deliberately: `pageReadElements` filters its list by this, and
+     * `pageWaitFor` decides `state: 'visible'` by it. Two copies of this rule
+     * would drift, and the failure mode of drift here is silent — a `wait` that
+     * reports "visible" for an element the element list would have skipped (or
+     * the reverse) is exactly the kind of disagreement that costs a debugging
+     * round. A report already hit the related trap by hand: it counted
+     * `display:none` rows as present and concluded a layout had no overflow.
+     *
+     * Note this is not the same question as "does the selector match": an element
+     * can be attached and invisible, which is why `state` distinguishes them.
+     * @param el - the element to test.
+     * @returns true when the element occupies layout boxes and is not hidden.
+     */
+    function pageVisible(el) {
+      if (el.getClientRects().length === 0) return false
+      const style = window.getComputedStyle(el)
+      if (style.visibility === 'hidden' || style.display === 'none') return false
+      if (style.opacity === '0') return false
+      return true
+    }
+
+    /**
+     * A short human label for an interactive element.
+     * @param el - the element to describe.
+     * @returns its accessible-ish name, bounded.
+     */
+    function pageLabelFor(el) {
+      const tag = el.tagName.toLowerCase()
+      const own =
+        el.getAttribute('aria-label') ||
+        (el.labels && el.labels.length > 0 ? el.labels[0].innerText : '') ||
+        el.getAttribute('placeholder') ||
+        el.getAttribute('title') ||
+        ''
+      if (own.trim() !== '') return own.trim().slice(0, 200)
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return ''
+      return (el.innerText || el.textContent || '').trim().slice(0, 200)
+    }
+
+    /**
      * Collect visible interactive elements, register each under a fresh `eN` ref,
      * and return their descriptors.
      *
@@ -288,27 +330,6 @@ window.__ModuleLoader__.load({
       const store = new Map()
       window.__dshAgentBrowserRefs = store
 
-      const visible = (el) => {
-        if (el.getClientRects().length === 0) return false
-        const style = window.getComputedStyle(el)
-        if (style.visibility === 'hidden' || style.display === 'none') return false
-        if (style.opacity === '0') return false
-        return true
-      }
-
-      const labelFor = (el) => {
-        const tag = el.tagName.toLowerCase()
-        const own =
-          el.getAttribute('aria-label') ||
-          (el.labels && el.labels.length > 0 ? el.labels[0].innerText : '') ||
-          el.getAttribute('placeholder') ||
-          el.getAttribute('title') ||
-          ''
-        if (own.trim() !== '') return own.trim().slice(0, 200)
-        if (tag === 'input' || tag === 'textarea' || tag === 'select') return ''
-        return (el.innerText || el.textContent || '').trim().slice(0, 200)
-      }
-
       const out = []
       let cut = false
       const nodes = document.querySelectorAll(
@@ -319,7 +340,7 @@ window.__ModuleLoader__.load({
           cut = true
           break
         }
-        if (!visible(el)) continue
+        if (!pageVisible(el)) continue
         const ref = 'e' + (out.length + 1)
         store.set(ref, el)
         const tag = el.tagName.toLowerCase()
@@ -329,7 +350,7 @@ window.__ModuleLoader__.load({
           ref,
           tag,
           type,
-          text: labelFor(el),
+          text: pageLabelFor(el),
           name: el.getAttribute('name') || '',
           value: typeof rawValue === 'string' ? rawValue.slice(0, 200) : '',
           disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
@@ -504,11 +525,96 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Wait inside the page until a condition holds, or the budget runs out.
+     *
+     * This exists because nothing else could express "the app is ready". Every
+     * wait the plugin had was a fixed sleep, and the reason is worth recording:
+     * `settle` is driven by Electron's NAVIGATION loading state, which a
+     * single-page app clears as soon as the HTML and its scripts arrive — long
+     * before React (or any framework) has mounted and painted. So the only tool
+     * available for "wait until the list is on screen" was guessing a duration,
+     * and a report measured exactly how that fails in both directions: too short
+     * on a slow machine, wasted time on a fast one.
+     *
+     * Polling lives in the page rather than in a loop of tool calls, so one call
+     * can watch for the condition without spending N round trips and N tool
+     * results to do it.
+     *
+     * `setTimeout` rather than `requestAnimationFrame`: rAF does not fire while a
+     * document is hidden, and a hidden tab is precisely the state this plugin
+     * already had to diagnose for screenshots. A wait that silently never
+     * completes in a background tab would be a worse trap than a coarse poll.
+     * @param selector - CSS selector to watch.
+     * @param state - `'attached'`, `'visible'` or `'hidden'`.
+     * @param timeoutMs - how long to keep checking.
+     * @returns a promise for the outcome, including whether the condition was met.
+     */
+    function pageWaitFor(selector, state, timeoutMs) {
+      const started = Date.now()
+      const deadline = started + Math.max(0, timeoutMs)
+      const poll = 50
+      return new Promise((resolve) => {
+        const settle = (matched) => {
+          resolve({
+            matched,
+            state,
+            selector,
+            waitedMs: Date.now() - started,
+            url: location.href,
+            title: document.title || '',
+          })
+        }
+        const satisfied = () => {
+          let el
+          try {
+            el = document.querySelector(selector)
+          } catch (error) {
+            // An invalid selector is a caller mistake, not a timeout: report it
+            // as such instead of polling for the full budget and then blaming
+            // the page for not matching.
+            return { invalid: String(error && error.message) }
+          }
+          if (state === 'attached') return { ok: el !== null }
+          if (state === 'visible') return { ok: el !== null && pageVisible(el) }
+          // 'hidden' is satisfied by absent as well as by invisible: both mean
+          // "not on screen", and requiring presence would make the state useless
+          // for waiting out a spinner that gets removed rather than hidden.
+          return { ok: el === null || !pageVisible(el) }
+        }
+        const check = () => {
+          const verdict = satisfied()
+          if (verdict.invalid !== undefined) {
+            resolve({
+              matched: false,
+              invalid: verdict.invalid,
+              state,
+              selector,
+              waitedMs: Date.now() - started,
+            })
+            return
+          }
+          if (verdict.ok) {
+            settle(true)
+            return
+          }
+          if (Date.now() >= deadline) {
+            settle(false)
+            return
+          }
+          setTimeout(check, Math.min(poll, Math.max(0, deadline - Date.now())))
+        }
+        check()
+      })
+    }
+
+    /**
      * Every page-side helper, in dependency order. `pageResolve` is referenced by
      * the interaction helpers, so it must be declared before them.
      */
     const PAGE_HELPERS = [
       pageResolve,
+      pageVisible,
+      pageLabelFor,
       pageIdentity,
       pageReadText,
       pageReadHtml,
@@ -518,6 +624,7 @@ window.__ModuleLoader__.load({
       pagePress,
       pageScroll,
       pageSelect,
+      pageWaitFor,
       pageEval,
     ]
 
@@ -1596,6 +1703,52 @@ window.__ModuleLoader__.load({
           // (which an earlier build did) let a single call cost twice what it
           // promised and outlive the Inspect channel's timeout.
           const waitMs = Math.min(Math.max(0, requested), budgetLeft(deadline))
+
+          // A named condition turns this from "sleep and hope" into an actual
+          // wait. Everything else about the action is unchanged, so a caller that
+          // only passes timeoutMs keeps the old behaviour.
+          if (selector !== null) {
+            const state = typeof input.state === 'string' && input.state !== '' ? input.state : 'visible'
+            if (!['attached', 'visible', 'hidden'].includes(state)) {
+              throw new Error(
+                `unknown wait state "${state}"; expected 'attached', 'visible' or 'hidden'.`,
+              )
+            }
+            // A named condition defaults to the REST of the call budget rather
+            // than to the 1 s the bare sleep defaults to: naming a condition says
+            // "wait for this", and answering after one second would usually mean
+            // "not yet" for the very case the condition exists for. Still capped
+            // by the remaining budget, so it cannot outlive the call.
+            const conditionMs = Number.isFinite(input.timeoutMs) ? waitMs : budgetLeft(deadline)
+            const outcome = await this.run(guest, pageWaitFor, [selector, state, conditionMs], budgetLeft(deadline))
+            if (outcome && outcome.invalid !== undefined) {
+              throw new Error(`that selector is not valid CSS: ${outcome.invalid}`)
+            }
+            // Report the miss instead of returning a success the caller would
+            // read as "it is ready now". The whole point of naming a condition is
+            // that the caller can trust the answer, and a wait that times out
+            // while claiming ok: true is the same class of lie this plugin has
+            // been fixing everywhere else.
+            if (outcome === undefined || outcome.matched !== true) {
+              const waited = Math.round((outcome?.waitedMs ?? conditionMs) / 1000)
+              throw new Error(
+                `the wait condition was not met within ${waited}s: no element matching "${selector}" ` +
+                  `became ${state}. The page is still not in that state — check the selector, or wait ` +
+                  'for something else that does change when it is ready.',
+              )
+            }
+            return prune({
+              tabId,
+              action,
+              ok: true,
+              matched: true,
+              state,
+              selector,
+              waitedMs: outcome.waitedMs,
+              ...(await this.describe(guest, budgetLeft(deadline))),
+            })
+          }
+
           await new Promise((resolve) => setTimeout(resolve, waitMs))
           await this.settle(guest, budgetLeft(deadline))
           return prune({
@@ -2456,6 +2609,11 @@ window.__ModuleLoader__.load({
                   deltaX: { type: 'number', description: 'Horizontal scroll pixels.' },
                   deltaY: { type: 'number', description: 'Vertical scroll pixels.' },
                   timeoutMs: { type: 'number', description: 'Wait budget for the wait action.' },
+                  state: {
+                    type: 'string',
+                    enum: ['attached', 'visible', 'hidden'],
+                    description: "For 'wait' with a selector: the state the element must reach.",
+                  },
                   ignoreCache: {
                     type: 'boolean',
                     description:

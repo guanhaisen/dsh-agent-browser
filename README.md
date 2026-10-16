@@ -40,7 +40,7 @@ browser_viewport { preset: "phone" }      -> re-render at 390×844
 |---|---|
 | `browser_tabs` | List this Session's browser tabs: id, title, url, loading state, **whether the load failed** (`failed`), whether the identity was inferred (`unverified`), whether each is mounted and drivable, which is `active`, and its `carrier` (`webview` on Desktop, `iframe` on Web). |
 | `browser_read` | Read a tab: `mode: 'text'` (default) for visible text, `'elements'` for the interactive elements you can act on, `'html'` for page HTML. Check `failed` first — a failed load reads as empty. `truncated` means the element cap was reached — hidden elements are filtered out silently and never counted as truncation. |
-| `browser_act` | `click`, `type`, `press`, `scroll`, `select`, `reload`, or `wait`. Target an element by the `ref` from a `'elements'` read, or by a CSS `selector`. `reload` takes `ignoreCache: true` to bypass the cache. |
+| `browser_act` | `click`, `type`, `press`, `scroll`, `select`, `reload`, or `wait`. Target an element by the `ref` from a `'elements'` read, or by a CSS `selector`. `reload` takes `ignoreCache: true` to bypass the cache. `wait` with a `selector` becomes a real wait — see *Waiting for the page* below. |
 | `browser_screenshot` | Capture the visible viewport as an image block the model can see. Pass a `preset` to size and capture in one call; the result reports the size it actually used and whether the page was confirmed to have reflowed (`confirmed`). A failed page is refused rather than captured. |
 | `browser_navigate` | Open a URL in a new tab, or navigate an existing one. |
 | `browser_viewport` | Read or change the tab's viewport size: `auto`, `phone` (390×844), `tablet` (834×1112), `desktop` (1280×800) or `custom`. The page reflows for real, so its own responsive breakpoints apply. Omit `tabId` to target the only mounted tab; the read always reports the tab it resolved. `custom` appears only for the `custom` preset. |
@@ -100,6 +100,50 @@ being briefly busy.
 Note that this is about *transport* failures only. An HTTP error the site itself
 rendered — a 404 page — is a real document and stays fully readable and
 screenshotable.
+
+## Waiting for the page
+
+`browser_act { action: "wait" }` has two forms, and the difference matters on any
+page a framework renders.
+
+**A fixed sleep** — `{ action: "wait", timeoutMs: 2500 }` — sleeps and returns.
+Rarely what you want, for a reason worth stating: the plugin's own notion of "the
+page has loaded" is Electron's **navigation** state, which a single-page app
+clears as soon as its HTML and scripts arrive, long before React (or anything
+else) has mounted and painted. So the page reports itself loaded while the screen
+is still empty, and a sleep is a guess that is too short on a slow machine and
+wasted on a fast one. A report measured exactly that: a 2500 ms guess in a loop
+that ran ten times.
+
+**A named condition** waits for something observable instead:
+
+```
+browser_act { action: "wait", selector: ".todo-list", state: "visible" }
+```
+
+- `state: "visible"` (the default) — the element is **drawn**. This is what "the
+  app has rendered" usually means.
+- `state: "attached"` — the element merely **exists**. Weaker, and worth knowing
+  about: an element can exist while `display: none`. A report counted hidden rows
+  as present and concluded a layout had no overflow, so the two are kept distinct.
+- `state: "hidden"` — satisfied by **absent as well as invisible**, so it works for
+  waiting out a spinner that gets removed rather than hidden.
+
+Omit `timeoutMs` and the wait uses the rest of the call's own budget (still
+bounded, never longer than the call).
+
+The condition is polled **inside the page**, so one tool call watches for it
+instead of a loop of calls and results. The poll uses `setTimeout` rather than
+`requestAnimationFrame` deliberately: rAF does not fire while a document is
+hidden, and a wait that silently never completes in a background tab would be a
+worse trap than a coarse poll.
+
+**A condition that never holds fails.** It does not return `ok: true` with a
+`matched: false` you might skim past — the call errors, naming the selector, the
+state and how long it waited. Naming a condition is a way to *trust* the answer, so
+a timeout returned as success would defeat the point. An invalid selector is
+reported as invalid CSS immediately rather than after burning the budget, because
+that is a caller mistake and not the page's fault.
 
 ## Which size to use
 
@@ -768,7 +812,7 @@ node test/run-all.cjs --offline
 |---|---|
 | `schema-check` | Every tool's raw JSON Schema against the real `dsh-tools` validator, and that each tool's `required` fields match whether it accepts an empty call. |
 | `client-check` | The Client provider manifest, `pageCall` codegen, guest lookup in a stub DOM, `getViewport`'s implicit-tab resolution, and the Web-profile refusal. |
-| `page-helpers-check` | Read / click / type / select / refusal paths, run against a DOM stub. |
+| `page-helpers-check` | Read / click / type / select / refusal paths, run against a DOM stub, plus the `wait` condition: that a met condition reports `matched`, that an unmet one FAILS rather than returning success, that `attached` and `visible` stay distinct questions, that `hidden` accepts absence, that an invalid selector is refused as invalid rather than as a timeout, and that a `wait` with no condition still just sleeps. |
 | `eval-gate-check` | The Host-side `enableEval` guard, including the `cordis_inspect_query` bypass. |
 | `viewport-check` | Sizing math, validation and clamping, and `setViewport` dispatch wiring. |
 | `apply-check` | `apply()` activation and seat registration — if this fails, the whole client half is down. |

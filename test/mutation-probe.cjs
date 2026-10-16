@@ -173,6 +173,59 @@ const mutations = [
     to: `    const evalEnabled = settings.enableEval === true
     if (evalEnabled) scope.effect(`,
   },
+  {
+    label: 'a wait condition that never holds reports success',
+    check: 'page-helpers-check.cjs',
+    // The trap the condition form exists to close: a caller names a condition so
+    // it can TRUST the answer, and a timeout returned as ok:true reads as "it is
+    // ready now". This is the same class of lie as the reachability wording.
+    from: `            if (outcome === undefined || outcome.matched !== true) {`,
+    to: `            if (false) {`,
+  },
+  {
+    label: 'a wait condition polls until the budget, never deciding',
+    check: 'page-helpers-check.cjs',
+    // Dropping the deadline makes the page-side promise resolve only when the
+    // condition holds — so a condition that never holds hangs instead of failing,
+    // and the caller is left with the outer transport timeout.
+    from: `          if (Date.now() >= deadline) {
+            settle(false)
+            return
+          }`,
+    to: `          if (false) {
+            settle(false)
+            return
+          }`,
+  },
+  {
+    label: 'attached and visible become the same question',
+    check: 'page-helpers-check.cjs',
+    // Conflating them is the documented trap: an element can exist while
+    // `display: none`, which is how a report counted hidden rows as present and
+    // concluded a layout had no overflow.
+    from: `          if (state === 'visible') return { ok: el !== null && pageVisible(el) }`,
+    to: `          if (state === 'visible') return { ok: el !== null }`,
+  },
+  {
+    label: 'state hidden requires the element to exist',
+    check: 'page-helpers-check.cjs',
+    // Waiting out a spinner that is REMOVED rather than hidden is the common
+    // case; requiring presence makes the state useless for it.
+    from: `          return { ok: el === null || !pageVisible(el) }`,
+    to: `          return { ok: el !== null && !pageVisible(el) }`,
+  },
+  {
+    label: 'an invalid selector is reported as a timeout',
+    check: 'page-helpers-check.cjs',
+    // It is a caller mistake, so blaming the page for not matching sends the
+    // caller looking in the wrong place — after burning the whole budget.
+    from: `            if (outcome && outcome.invalid !== undefined) {
+              throw new Error(\`that selector is not valid CSS: \${outcome.invalid}\`)
+            }`,
+    to: `            if (false) {
+              throw new Error(\`that selector is not valid CSS: \${outcome.invalid}\`)
+            }`,
+  },
 ]
 
 let problems = 0

@@ -686,22 +686,31 @@ async function main() {
     const vm = require('node:vm')
     const fs = require('node:fs')
     const source = fs.readFileSync(CLIENT, 'utf8')
-    // Lift pageReadElements out of the bundle and run it against a DOM stub, so
-    // the flag's real computation is what gets judged.
-    const start = source.indexOf('function pageReadElements(')
-    let depth = 0
-    let end = -1
-    for (let i = source.indexOf('{', start); i < source.length; i++) {
-      if (source[i] === '{') depth++
-      else if (source[i] === '}') {
-        depth--
-        if (depth === 0) {
-          end = i + 1
-          break
+    // Lift helpers out of the bundle and run them against a DOM stub, so the
+    // flag's real computation is what gets judged.
+    //
+    // `pageReadElements` depends on the SHARED visibility and label rules, which
+    // it now calls rather than redefining. Those rules are shared on purpose —
+    // `pageWaitFor` decides `state: 'visible'` by the same predicate, and two
+    // copies would drift — so this check has to pull the dependencies in too.
+    // Lifting the function alone silently produced a ReferenceError at runtime,
+    // which is what a dependency-aware slice prevents.
+    const sliceFunction = (name) => {
+      const start = source.indexOf(`function ${name}(`)
+      if (start < 0) throw new Error(`cannot find ${name} in the bundle`)
+      let depth = 0
+      for (let i = source.indexOf('{', start); i < source.length; i++) {
+        if (source[i] === '{') depth++
+        else if (source[i] === '}') {
+          depth--
+          if (depth === 0) return source.slice(start, i + 1)
         }
       }
+      throw new Error(`unterminated ${name} in the bundle`)
     }
-    const pageReadElementsSrc = source.slice(start, end)
+    const pageReadElementsSrc = ['pageVisible', 'pageLabelFor', 'pageReadElements']
+      .map(sliceFunction)
+      .join('\n')
 
     const makeEl = (props = {}) => ({
       tagName: (props.tag ?? 'button').toUpperCase(),

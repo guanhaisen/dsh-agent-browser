@@ -318,7 +318,9 @@ function apply(ctx, config) {
         tools.register({
           name: 'browser_act',
           description:
-            "Interact with the in-app browser page. Actions: 'click' an element, 'type' text into it, 'press' a key, 'scroll' the page or an element, 'select' an option, 'reload' the page, or 'wait' for the page to settle. Target an element by the ref returned from browser_read mode 'elements', or by an explicit CSS selector. Read the page again afterwards to confirm what changed. Reach for 'reload' when a page has stopped answering, or when freshly edited CSS or JS appears not to have taken effect — pass ignoreCache: true for the latter, since a dev server that sends no cache headers (python -m http.server, for instance) lets Chrome serve the old files.",
+            "Interact with the in-app browser page. Actions: 'click' an element, 'type' text into it, 'press' a key, 'scroll' the page or an element, 'select' an option, 'reload' the page, or 'wait'.\n\n" +
+            "'wait' has two forms. With only timeoutMs it sleeps for that long — rarely what you want. With a `selector` it waits until that element reaches `state` ('visible' by default, or 'attached' / 'hidden') and reports `matched` when it gets there; if it never does, the call FAILS saying so rather than returning a success you would read as 'ready'. Prefer the condition form for anything a single-page app renders after load: the page reports itself loaded as soon as its scripts arrive, long before the framework has mounted, so a fixed sleep is a guess that is too short on a slow machine and wasted on a fast one.\n\n" +
+            "Target an element by the ref returned from browser_read mode 'elements', or by an explicit CSS selector. Read the page again afterwards to confirm what changed. Reach for 'reload' when a page has stopped answering, or when freshly edited CSS or JS appears not to have taken effect — pass ignoreCache: true for the latter, since a dev server that sends no cache headers (python -m http.server, for instance) lets Chrome serve the old files.",
           parameters: {
             type: 'object',
             properties: {
@@ -329,7 +331,11 @@ function apply(ctx, config) {
                 description: 'Interaction to perform.',
               },
               ref: { type: 'string', description: 'Element ref from a browser_read elements result.' },
-              selector: { type: 'string', description: 'CSS selector, used instead of ref.' },
+              selector: {
+                type: 'string',
+                description:
+                  "CSS selector, used instead of ref. For 'wait' it names the condition to wait for, which turns the action into a real wait.",
+              },
               text: {
                 type: 'string',
                 description: "Text to enter for 'type', or the option value/label for 'select'.",
@@ -340,7 +346,17 @@ function apply(ctx, config) {
               },
               deltaX: { type: 'number', description: "Horizontal scroll pixels for 'scroll'." },
               deltaY: { type: 'number', description: "Vertical scroll pixels for 'scroll'." },
-              timeoutMs: { type: 'number', description: "Wait budget in milliseconds for 'wait'." },
+              state: {
+                type: 'string',
+                enum: ['attached', 'visible', 'hidden'],
+                description:
+                  "For 'wait' with a selector: what the element must become. 'visible' (default) requires it to be drawn, which is what 'the app has rendered' usually means — 'attached' only requires it to exist, and an element can exist while `display: none`. 'hidden' is satisfied by absent as well as invisible, for waiting out a spinner that is removed rather than hidden.",
+              },
+              timeoutMs: {
+                type: 'number',
+                description:
+                  "For 'wait': the budget in milliseconds. Omitted with a selector, the wait uses the rest of the call's own budget.",
+              },
               ignoreCache: {
                 type: 'boolean',
                 description:
@@ -361,6 +377,10 @@ function apply(ctx, config) {
                 url: { type: 'string' },
                 title: { type: 'string' },
                 loading: { type: 'boolean' },
+                // Present only for a condition wait, so they stay optional.
+                matched: { type: 'boolean' },
+                state: { type: 'string' },
+                waitedMs: { type: 'number' },
               },
               required: ['tabId', 'action', 'url', 'title', 'loading'],
               additionalProperties: true,
@@ -370,7 +390,7 @@ function apply(ctx, config) {
           presentCall: presentCall('Act on browser page'),
           async execute(args, exec) {
             const input = { action: args.action }
-            for (const key of ['tabId', 'ref', 'selector', 'text', 'key']) {
+            for (const key of ['tabId', 'ref', 'selector', 'text', 'key', 'state']) {
               if (typeof args[key] === 'string' && args[key] !== '') input[key] = args[key]
             }
             for (const key of ['deltaX', 'deltaY', 'timeoutMs']) {

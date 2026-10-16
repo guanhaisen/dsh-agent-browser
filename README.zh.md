@@ -32,7 +32,7 @@ browser_viewport { preset: "phone" }      -> 以 390×844 重新渲染
 |---|---|
 | `browser_tabs` | 列出当前 Session 的浏览器 tab：id、标题、url、加载状态、**加载是否失败**（`failed`）、身份是否为推断（`unverified`）、是否已挂载可驱动、哪个是 `active`，以及它的 `carrier`（桌面端为 `webview`，Web 为 `iframe`）。 |
 | `browser_read` | 读取一个 tab：`mode: 'text'`（默认）返回可见文本，`'elements'` 返回可操作的交互元素，`'html'` 返回页面 HTML。先看 `failed` —— 加载失败的页面读出来是空的。`truncated` 表示撞到了元素数量上限 —— 隐藏元素会被静默过滤，绝不计入截断。 |
-| `browser_act` | `click`、`type`、`press`、`scroll`、`select`、`reload` 或 `wait`。用 `'elements'` 读取得到的 `ref` 定位元素，或用 CSS `selector`。`reload` 可传 `ignoreCache: true` 绕过缓存。 |
+| `browser_act` | `click`、`type`、`press`、`scroll`、`select`、`reload` 或 `wait`。用 `'elements'` 读取得到的 `ref` 定位元素，或用 CSS `selector`。`reload` 可传 `ignoreCache: true` 绕过缓存。`wait` 传 `selector` 时会变成真正的等待 —— 见下面的*等待页面就绪*。 |
 | `browser_screenshot` | 截取可见视口，作为模型能看到的图片块返回。传 `preset` 即可一次调用完成「设尺寸 + 截图」；结果会报告它实际使用的尺寸，以及页面是否已被确认按该尺寸重排（`confirmed`）。加载失败的页面会被拒绝，而不是被截下来。 |
 | `browser_navigate` | 在新 tab 打开 URL，或导航已有 tab。 |
 | `browser_viewport` | 读取或修改 tab 的视口尺寸：`auto`、`phone`（390×844）、`tablet`（834×1112）、`desktop`（1280×800）或 `custom`。页面会真实重排，因此站点自身的响应式断点会生效。省略 `tabId` 时作用于唯一已挂载的 tab；读取时总会报告它实际解析到的 tab。`custom` 字段只在 `custom` 预设下出现。 |
@@ -73,6 +73,28 @@ browser_close    { tabId: "tab4" }             -> 收尾时清理
 所以 `unverified` 刻意**不**只是一个警告标签：它正是让一次截图「无法被验证」的条件。在截图内部，身份探测被给予比别处更多的耐心（最多 4 秒），正是为了让真正很重的页面 —— 那个需要 15 秒预算的多 iframe 场景 —— 不会仅仅因为一时繁忙就被拒绝。
 
 注意这只针对**传输层**失败。站点自己渲染出来的 HTTP 错误（比如 404 页面）是真实文档，依然可以正常读取和截图。
+
+## 等待页面就绪
+
+`browser_act { action: "wait" }` 有两种形态，而对任何由框架渲染的页面来说，这个区别很关键。
+
+**固定睡眠** —— `{ action: "wait", timeoutMs: 2500 }` —— 睡一觉就返回。它很少是你想要的，原因值得说清：插件自身对「页面已加载」的判据是 Electron 的**导航**状态，而单页应用在 HTML 与脚本一到就会把它清掉，远早于 React（或任何框架）挂载并绘制完成。于是页面自称已加载，而屏幕仍然是空的 —— 睡眠就是一个猜出来的时长，慢机器上太短、快机器上白等。有一份报告实测的正是这个：一个跑十轮的循环里，每轮都猜 2500ms。
+
+**具名条件**则改为等待某个可观测的事实：
+
+```
+browser_act { action: "wait", selector: ".todo-list", state: "visible" }
+```
+
+- `state: "visible"`（默认）—— 元素**被绘制出来**。这通常就是「应用已渲染」的意思。
+- `state: "attached"` —— 元素**仅存在**。它更弱，而且值得知道：元素可以在 `display: none` 的情况下存在。有一份报告把隐藏的行算作「存在」，从而得出「版面没有溢出」的结论，因此这两者被刻意区分开。
+- `state: "hidden"` —— **不存在或被隐藏都算满足**，因此适合等待一个被「移除」而不是被隐藏的 loading 指示。
+
+省略 `timeoutMs` 时，等待会使用本次调用剩余的全部预算（仍然有界，绝不超出该调用）。
+
+条件轮询发生在**页面内部**，因此一次工具调用就能盯住它，而不必用一串调用与结果去轮询。轮询刻意使用 `setTimeout` 而非 `requestAnimationFrame`：文档隐藏时 rAF 不会触发，而一个在后台 tab 里静默永不完成的等待，会比一个粗糙的轮询更糟。
+
+**条件始终不成立时会失败。** 它不会返回一个你可能扫一眼就错过的 `ok: true` 加 `matched: false` —— 调用会报错，并点名选择器、状态与等待时长。给条件命名正是为了**信任**那个答案，因此把超时当作成功返回就抵消了它的意义。非法选择器会立刻以「不是合法 CSS」拒绝，而不是耗完预算之后再说 —— 那是调用方的错误，不是页面的问题。
 
 ## 该用哪个尺寸
 
@@ -449,7 +471,7 @@ node test/run-all.cjs --offline
 |---|---|
 | `schema-check` | 每个工具的原始 JSON Schema 对比真实的 `dsh-tools` 校验器，并断言每个工具的 `required` 字段与其是否接受空调用相符。 |
 | `client-check` | Client provider manifest、`pageCall` 代码生成、在 stub DOM 中的 guest 查找、`getViewport` 的隐式 tab 解析，以及 Web profile 的拒绝行为。 |
-| `page-helpers-check` | 读取 / 点击 / 输入 / 选择 / 拒绝路径，针对 DOM stub 运行。 |
+| `page-helpers-check` | 读取 / 点击 / 输入 / 选择 / 拒绝路径，针对 DOM stub 运行；外加 `wait` 条件：成立时报 `matched`、不成立时**失败**而不是返回成功、`attached` 与 `visible` 保持为两个不同问题、`hidden` 接受「不存在」、非法选择器以「非法」而非「超时」被拒、以及不带条件的 `wait` 仍然只是睡眠。 |
 | `eval-gate-check` | Host 侧的 `enableEval` guard：`cordis_inspect_query` 绕过路径必须被拒；`browser_eval` 在关闭时仍**注册**但调用即拒绝并说明开关；开启时则确实到达 provider。 |
 | `viewport-check` | 尺寸计算、校验与钳制，以及 `setViewport` 的分发接线。 |
 | `apply-check` | `apply()` 激活与座位注册 —— 这一项失败意味着整个 client 半身失效。 |
