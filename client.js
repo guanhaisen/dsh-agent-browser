@@ -95,6 +95,11 @@ window.__ModuleLoader__.load({
       call: 6_000,
       screenshot: 15_000,
       identity: 1_000,
+      // Upper bound on the patience a screenshot spends confirming the page can
+      // be inspected at all. Higher than the shared identity probe because a
+      // heavy page may be briefly busy, and lower than the screenshot budget so
+      // a real capture still has time afterwards.
+      identityCeiling: 4_000,
       confirm: 2_000,
       confirmReserve: 2_000,
     }
@@ -1361,13 +1366,28 @@ window.__ModuleLoader__.load({
       /**
        * List the Session's browser tabs, marking which are mounted and which is
        * active.
+       *
+       * One deadline covers the whole listing. Each tab needs its own identity
+       * probe, and a probe costs up to the identity budget when a page is busy,
+       * so giving every tab a fresh budget would let a Session full of stalled
+       * tabs spend N × that — an unbounded answer to a question that is supposed
+       * to be the cheap way to find out what is open. Every tab keeps its own
+       * smaller share of what remains, and a tab that runs out is reported as
+       * unverified rather than holding up the rest.
        * @param sessionId - owning Session.
        * @returns the tab list.
        */
       async listTabs(sessionId) {
+        const deadline = beginCall()
         const guests = this.guests(sessionId)
         const inventory = this.inventory(sessionId)
         const activeTabId = this.activeTabId(sessionId)
+        // A fair share, floored so a single tab is still given a real chance and
+        // capped so a huge listing does not wait a full probe per tab.
+        const share = Math.max(
+          250,
+          Math.min(BUDGETS.identity, Math.floor(budgetLeft(deadline) / Math.max(1, inventory.length))),
+        )
         const tabs = []
         for (const record of inventory) {
           const entry = guests.get(record.tabId)
@@ -1380,7 +1400,8 @@ window.__ModuleLoader__.load({
           // unreadable, and reporting it as unmounted would be a lie the user
           // cannot act on. `carrier` is how the model tells the two apart.
           if (entry !== undefined && entry.carrier === 'webview') {
-            const described = await this.describe(entry.element)
+            const allowance = Math.min(share, Math.max(0, budgetLeft(deadline)))
+            const described = await this.describe(entry.element, allowance)
             title = described.title
             url = described.url
             loading = described.loading
@@ -1614,12 +1635,46 @@ window.__ModuleLoader__.load({
         // paints — Chrome's error page, or a blank surface if it never rendered
         // — and returning that as a successful capture is how an agent came to
         // report a page as "not rendered" and wasted a round diagnosing CSS.
-        const before = await this.describe(guest, Math.min(BUDGETS.identity, budgetLeft(deadline)))
+        //
+        // Ask with more patience than the shared identity probe allows before
+        // concluding the page is unreachable. `location.href` is trivially cheap
+        // to answer, but a genuinely heavy page (the report's several-iframes-
+        // running-canvas case) can be briefly busy, and refusing THAT capture
+        // would defeat the larger screenshot budget. So a busy page gets up to a
+        // few seconds; only a page that still cannot answer is treated as
+        // unverifiable.
+        //
+        // Bounded by what is LEFT, not just by the ceiling: this call's contract
+        // is that the whole thing fits in its budget, and granting a fixed floor
+        // here could exceed the remaining time.
+        const remaining = Math.max(0, budgetLeft(deadline))
+        const identityBudget = Math.min(
+          remaining,
+          Math.max(BUDGETS.identity, Math.min(BUDGETS.identityCeiling, Math.floor(remaining / 2))),
+        )
+        const before = await this.describe(guest, identityBudget)
         if (before.failed) {
           throw new Error(
             `this tab is on a failed page load ("${before.url}"), so a screenshot would capture the ` +
               'browser error page rather than the site. Check that the server is running at the URL ' +
               'you navigated to, then navigate again (or browser_act { action: \'reload\' }).',
+          )
+        }
+        // The mirror image of the case above, and the one an earlier build still
+        // got wrong: a renderer that cannot be scripted at all (wedged, or
+        // crashed) reports NO address, so `failed` cannot be evaluated and stays
+        // false. Capturing then hands back a blank surface — byte-for-byte the
+        // same symptom the report describes for a dead server, and just as
+        // misleading — because the only check in place tested a flag that this
+        // path can never set. Refusing is the honest answer: the page could not
+        // be verified, so nothing can be promised about what the image shows.
+        if (before.unverified) {
+          throw new Error(
+            'the page did not answer, so a screenshot could not be verified. A capture now would be a ' +
+              'blank or stale surface rather than the site — which is exactly how a failed page gets ' +
+              'mistaken for a page that "did not render". The tab is either mid-navigation or its ' +
+              "renderer has stalled. Wait for it to settle, or reload it with " +
+              "browser_act { action: 'reload' }, then retry.",
           )
         }
 

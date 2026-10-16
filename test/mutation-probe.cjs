@@ -77,6 +77,24 @@ const mutations = [
     to: `        this.closeBrowserTab(sessionId, tabId)`,
   },
   {
+    label: 'a wedged page captured as a blank image',
+    from: `        if (before.unverified) {
+          throw new Error(
+            'the page did not answer, so a screenshot could not be verified.`,
+    to: `        if (false && before.unverified) {
+          throw new Error(
+            'the page did not answer, so a screenshot could not be verified.`,
+  },
+  {
+    label: 'tab listing spends a full probe budget per tab',
+    // The pre-fix code called describe() with no budget, so it fell back to the
+    // DEFAULT per-probe budget for every tab. Mutating to `budgetLeft(deadline)`
+    // would be wrong: that is already bounded and would prove nothing.
+    from: `            const allowance = Math.min(share, Math.max(0, budgetLeft(deadline)))
+            const described = await this.describe(entry.element, allowance)`,
+    to: `            const described = await this.describe(entry.element)`,
+  },
+  {
     label: 'custom viewport confirmed against a fallback size',
     from: `        const target = resolveViewport({
           preset: snapshot.byTab[tabId]?.preset ?? preset,

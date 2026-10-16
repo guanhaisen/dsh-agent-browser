@@ -570,6 +570,7 @@ async function main() {
     ])
     const bundle = loadBundle(world)
     bundle.budgets.identity = 500
+    bundle.budgets.identityCeiling = 1000
     bundle.budgets.screenshot = 4000
     bundle.budgets.confirm = 1000
     world.guestOf('tab1').capturePage = async () => ({
@@ -581,6 +582,108 @@ async function main() {
     check('a healthy page still captures', shot.base64 === 'AAAA', shot)
     check('the capture reports its confirmed size', shot.confirmed === true, shot)
     check('the capture reports the size the page laid out at', shot.pageWidth === 1280, shot)
+  }
+
+  // A WEDGED renderer must not yield a blank image reported as success. This is
+  // the report's actual harm: with the server down the page cannot be scripted,
+  // so `failed` cannot even be evaluated — Electron keeps reporting the address
+  // that was REQUESTED — and a check on `failed` alone never fires.
+  {
+    const guest = makeGuest({ executeJavaScript: () => never() })
+    guest.capturePage = async () => ({
+      getSize: () => ({ width: 10, height: 10 }),
+      resize() { return this },
+      toDataURL: () => 'data:image/png;base64,AAAA',
+    })
+    guest.getURL = () => 'http://localhost:3000/'
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 120
+    bundle.budgets.identityCeiling = 200
+    bundle.budgets.screenshot = 3000
+    let error
+    try {
+      await bundle.provider.query('screenshot', {}, { sessionId: SESSION })
+    } catch (thrown) {
+      error = thrown
+    }
+    check('a page that cannot be inspected is not captured as a blank image', error !== undefined, String(error))
+    check(
+      'the refusal explains the page did not answer',
+      /did not answer/.test(String(error?.message)) && /blank/.test(String(error?.message)),
+      String(error?.message),
+    )
+  }
+
+  // The refusal must not defeat the larger screenshot budget: a page that answers
+  // slowly — the heavy-page case that budget exists for — still captures,
+  // because the identity probe is given more patience inside a capture. The page
+  // is modelled as ONE call that settles late, which is what a busy renderer
+  // actually does (the pending call resolves once it frees up).
+  {
+    const guest = makeGuest({
+      executeJavaScript: async (code) => {
+        if (typeof code === 'string' && code.includes('window.innerWidth')) {
+          return { w: 1280, h: 800 }
+        }
+        if (typeof code === 'string' && code.includes('location.href')) {
+          // Slower than the shared identity budget, well inside the ceiling.
+          await new Promise((resolve) => setTimeout(resolve, 150))
+          return { url: 'https://example.test/', title: 'Example', readyState: 'complete' }
+        }
+        return { url: 'https://example.test/', title: 'Example', readyState: 'complete' }
+      },
+    })
+    guest.capturePage = async () => ({
+      getSize: () => ({ width: 10, height: 10 }),
+      resize() { return this },
+      toDataURL: () => 'data:image/png;base64,AAAA',
+    })
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 60
+    bundle.budgets.identityCeiling = 2000
+    bundle.budgets.screenshot = 6000
+    let shot
+    let error
+    try {
+      shot = await bundle.provider.query('screenshot', {}, { sessionId: SESSION })
+    } catch (thrown) {
+      error = thrown
+    }
+    check(
+      'a briefly busy page is still captured rather than refused',
+      shot?.base64 === 'AAAA',
+      error ? String(error.message) : shot,
+    )
+  }
+
+  // A Session full of stalled tabs must not make the listing cost one full probe
+  // per tab: the whole listing shares one deadline.
+  {
+    const world = makeWorld([
+      { sessionId: SESSION, tabId: 'tab1', guest: makeGuest({ executeJavaScript: () => never() }) },
+      { sessionId: SESSION, tabId: 'tab2', guest: makeGuest({ executeJavaScript: () => never() }) },
+      { sessionId: SESSION, tabId: 'tab3', guest: makeGuest({ executeJavaScript: () => never() }) },
+      { sessionId: SESSION, tabId: 'tab4', guest: makeGuest({ executeJavaScript: () => never() }) },
+    ])
+    const bundle = loadBundle(world)
+    bundle.budgets.call = 400
+    bundle.budgets.identity = 400
+    const started = Date.now()
+    const listed = await bundle.provider.query('listTabs', {}, { sessionId: SESSION })
+    const elapsed = Date.now() - started
+    check('a listing of stalled tabs still answers', listed.tabs.length === 4, listed.tabs.length)
+    check(
+      'the listing is bounded by ONE deadline, not one per tab',
+      elapsed < 1500,
+      { elapsed, perTabBudget: 400, tabs: 4 },
+    )
+    check(
+      'every stalled tab is reported unverified',
+      listed.tabs.every((tab) => tab.unverified === true),
+      listed.tabs,
+    )
   }
 
   // ---------------------------------------------------------------------

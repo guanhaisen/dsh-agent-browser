@@ -68,6 +68,10 @@ browser_close    { tabId: "tab4" }             -> 收尾时清理
 
 `unverified: true` 是另一半：页面完全无法被询问（渲染进程卡死，或文档不可达），此时 `url` 与 `title` 来自**上一次导航**，而不是当前文档。把它们当线索，不要当事实。
 
+这两者对截图尤其要紧，因为混淆的代价在这里最大：只要两者任一成立，截图就会被**拒绝**。加载失败会画出 Chrome 错误页，渲染进程卡死会画出空白画面 —— 无论哪种，图像都不是站点本身，而把它当作成功截图返回，正是「从未加载成功的页面」被误判成「页面没有渲染」的原因。注意页面完全无法执行脚本时连 `failed` 都无法求值，因此 `unverified` 在这里承担了实质工作，而不只是重复标注。
+
+所以 `unverified` 刻意**不**只是一个警告标签：它正是让一次截图「无法被验证」的条件。在截图内部，身份探测被给予比别处更多的耐心（最多 4 秒），正是为了让真正很重的页面 —— 那个需要 15 秒预算的多 iframe 场景 —— 不会仅仅因为一时繁忙就被拒绝。
+
 注意这只针对**传输层**失败。站点自己渲染出来的 HTTP 错误（比如 404 页面）是真实文档，依然可以正常读取和截图。
 
 ## 该用哪个尺寸
@@ -244,6 +248,7 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
 - **一个 `store` handle 只能挂载在一个 slot scope 下。**在注册项上声明 `store` 会让渲染器绑定 `useStore`/`actions`，但同一个 handle 无法挂在两个不同 scope 下 —— 本插件需要把状态同时用于 session scope 的座位（tab 菜单）与 root scope 的座位（设置 → 通用），这样做会抛出 `store handle mounted under … is already mounted under scope …`。因此 store 以普通 prop 传递，组件直接用 `React.useSyncExternalStore` 订阅。快照必须保持引用稳定；`test/apply-check.cjs` 断言组件未声明 `store` handle。
 - **无法交付的截图仍会正常作答。**若未挂载 attachment store，或 store 拒绝了该图片（例如截图过大），结果会丢弃字节并在 `note` 中说明原因，而不是让调用失败。
 - **每次 guest 调用都受插件自身预算约束。**读取与动作 6 秒，截图 15 秒，每个方法都会做的那次身份探测 1 秒。Electron 的 `executeJavaScript`、`capturePage` 与 `loadURL` 都不接受 abort signal，也没有超时，因此无响应的渲染进程永远不会 settle；与定时器竞速是插件唯一能掌握的界限。裸 await 它们，正是让一个卡死页面每次调用固定花掉 60 秒的原因（Inspect 通道的默认超时）—— 一位 agent 撞上 8 次，等了约 8 分钟。该预算不可配置：client 半身读不到插件配置，所以它是常量而非设置项；外层的 `clientInspectTimeoutMs` 依然生效。
+- **`browser_tabs` 整次列举共享一个截止时间。**每个 tab 都需要自己的身份探测，否则一个满是卡死标签的 Session 会按 tab 数各花掉一整份预算 —— 对一个本该用来「便宜地看看开了什么」的问题给出无界答案。每个 tab 只分到剩余时间的公平份额，并设下限以免小列表被饿死。
 - **超时并不等于取消。**因为 Electron 无法中止，操作可能在调用报告超时之后仍在后台完成。那条消息说的是插件等了多久，绝不是声称工作已经停止。
 - **截图默认使用 Sidebar 栏宽。**`auto` 通常是 400–700 CSS 像素，并非真实设备尺寸。当版面重要时，请传 `preset`（或先用 `browser_viewport` 设好）。
 - **截图只含视口** —— 没有整页截图。
@@ -434,7 +439,7 @@ node test/run-all.cjs --offline
 | `viewport-controller-check` | 哪个元素获得哪些内联样式、居中、回退、未挂载的 tab。 |
 | `contract-check` | 每个工具的**真实**结果形状 —— 成功与降级 —— 经过注册表自身的 lossless-JSON detach 与输出 schema 校验，外加 `truncated` 标志语义与活动 tab 报告。 |
 | `session-scope-check` | 打开 tab 时以**发起调用的** Session 为地址，而不是屏幕上显示的那个；以及落进别的对话的 tab 会被如实点名，而不是被说成仅仅「未挂载」。 |
-| `resilience-check` | 卡死的页面会被插件预算兜住而不是拖住整次调用；视口改变是被确认的而不是被假定的；加载失败会被如实报告且被截图路径拒绝；reload / close 真的有效。看门狗把「挂住」变成失败 —— 没有它，移除被测的那道界限会让进程以 0 退出，看起来一片绿。 |
+| `resilience-check` | 卡死的页面会被插件预算兜住而不是拖住整次调用；视口改变是被确认的而不是被假定的；加载失败会被如实报告且被截图路径拒绝；无法执行脚本的卡死页面不会被当作空白图截下来；标签列举共享一个截止时间；reload / close 真的有效。看门狗把「挂住」变成失败 —— 没有它，移除被测的那道界限会让进程以 0 退出，看起来一片绿。 |
 
 其中三个必须在打包后的可执行文件里以 Node 模式运行，因为它们从 `app.asar` 导入真实校验器；`run-all.cjs` 会替你处理。
 
