@@ -577,7 +577,7 @@ restart.
 
 ### Where the controls appear
 
-- The model gains six tools (seven with `enableEval: true`).
+- The model gains seven tools (eight with `enableEval: true`).
 - **Right-click a browser tab** for *Viewport size* (fit / phone / tablet /
   desktop / custom).
 - **Settings → General → Browser viewport** sets the default for new tabs.
