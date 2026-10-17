@@ -17,6 +17,14 @@
  * Web profiles the Sidebar browser is an iframe, which cannot be read, so the
  * provider answers with an explicit reason instead of pretending to work.
  *
+ * Provider slot
+ * -------------
+ * When the harness provides the `browserUse` service, this plugin claims its
+ * exclusive provider slot, so it is the *declared* owner of browser automation
+ * rather than just a plugin that happens to register `browser_*` tools. The
+ * service is optional: 0.2.1-rc.2 declares it in the API catalog but ships no
+ * implementation, so the claim is conditional and the tools never depend on it.
+ *
  * Definitions here are raw registry definitions rather than `defineTool`
  * output, so `parameters` is written as plain JSON Schema (the same subset the
  * tool registry enforces: type/oneOf/properties/required/additionalProperties/
@@ -162,8 +170,70 @@ function apply(ctx, config) {
     return exec.agent
   }
 
+  // Reserve the shared browser-use provider slot when the harness offers one.
+  //
+  // `browserUse` is the harness's own extension point for "the one plugin that
+  // owns browser automation in this composition": the slot is exclusive, and a
+  // second registration fails even when it repeats the same name. Claiming it
+  // is what makes this plugin the declared browser provider instead of merely a
+  // plugin that happens to register `browser_*` tools, so a future harness
+  // surface (or a competing plugin) can detect the owner and refuse to
+  // double-register.
+  //
+  // It is OPTIONAL on purpose, and the undefined check is the whole point:
+  // `browserUse` is declared in the harness API catalog but is not provided by
+  // any shipped package in 0.2.1-rc.2. Writing it into `inject` would make the
+  // plugin wait forever for a service that never arrives, silently disabling
+  // every browser tool — a far worse failure than running without the claim.
+  // So: claim when present, behave exactly as before when absent.
+  //
+  // The registration is async (it returns a disposer promise) and deliberately
+  // not awaited: `apply` is synchronous, and a harness that does provide the
+  // slot is expected to be reserving, not blocking. A rejection is reported
+  // rather than thrown so a failed claim cannot take down the tools.
   ctx.inject(['tools'], (scope) => {
     const tools = scope.tools
+
+    // Claim the shared browser-use slot, if this composition has one.
+    //
+    // `ctx.get` is used rather than `ctx.browserUse` because the service is
+    // optional: the harness declares it in its API catalog, but no shipped
+    // package provides it today, so a hard read would throw or hang. Reading it
+    // off the same `ctx` the rest of this half uses keeps one lookup path. The
+    // claim is owned by an effect so unloading the plugin releases the slot
+    // instead of leaving it reserved by a dead registration.
+    scope.effect(() => {
+      const browserUse = ctx.get('browserUse')
+      if (browserUse === undefined) return () => {}
+      let release
+      let released = false
+      const done = browserUse.register('dsh-agent-browser')
+      // The contract returns a disposer promise. Swallow a rejection into a
+      // diagnostic: failing to claim the slot must not disable the tools, since
+      // the tools are the actual capability and the slot is only a declaration.
+      Promise.resolve(done).then(
+        (disposer) => {
+          if (typeof disposer !== 'function') return
+          if (released) {
+            // The plugin was unloaded while the claim was still settling.
+            void disposer()
+            return
+          }
+          release = disposer
+        },
+        (error) => {
+          const message = error instanceof Error ? error.message : String(error)
+          console.error(
+            `dsh-agent-browser: could not claim the shared browser-use provider slot: ${message}. ` +
+              'The browser tools still work; another plugin may already own browser automation.',
+          )
+        },
+      )
+      return () => {
+        released = true
+        if (typeof release === 'function') void release()
+      }
+    }, 'dsh-agent-browser: browser-use slot')
 
     // Gating `browser_eval` by simply not registering the tool is not enough:
     // the Client provider always declares an `eval` method, and the model also

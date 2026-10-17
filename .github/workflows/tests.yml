@@ -1,9 +1,10 @@
 name: tests
 
-# Runs the checks that need no packaged DSH install. Three suites (schema-check,
-# client-check and contract-check) import the real `dsh-tools` validators out of
-# the application's `app.asar`, which is not available in CI, so the runner is
-# invoked with `--offline` and reports those three as SKIP rather than pretending
+# Runs the checks that need no packaged DSH install. Four suites (schema-check,
+# client-check, contract-check and runtime-mount-check) import real modules out of
+# the application's `app.asar` — the `dsh-tools` validators, the Client runtime,
+# and the Cordis framework itself — which is not available in CI, so the runner is
+# invoked with `--offline` and reports those four as SKIP rather than pretending
 # they passed.
 #
 # No dependencies to install: the plugin is bundled by hand and every check is a

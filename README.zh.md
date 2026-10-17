@@ -23,6 +23,7 @@ browser_viewport { preset: "phone" }      -> 以 390×844 重新渲染
 - [工具](#tools) —— 模型可以调用的能力
 - [该用哪个尺寸](#该用哪个尺寸) —— 选电脑或手机，别用默认
 - [视口尺寸](#viewport-sizes) —— UI 一侧
+- [版本适配](#compatibility) —— 已针对 DSH `0.2.1-rc.2` 验证
 - [已知限制](#known-limitations) —— 提问前请先读
 
 <a id="tools"></a>
@@ -269,6 +270,19 @@ provider 在 `[data-sidebar-right-session]` 内读取 `[data-sidebar-right-tab]`
 
 控件位于公开的加法式座位 —— `sidebar.right.tab.menu.item` 与 `settings.general.item` —— 而非替换任何东西，因此内置浏览器保持原样工作，禁用插件时整个特性完全消失。
 
+### Provider 槽位
+
+当 harness 提供 `browserUse` 服务时，Host 半边会以 `dsh-agent-browser` 之名占用它独占的 provider 槽位。这个槽位是组合用来声明「由哪个插件负责浏览器自动化」的方式：它只允许一个持有者，第二次注册即使名字相同也会失败；持有它之后，未来的 harness 界面（或与之竞争的插件）就能直接看到持有者是谁，而不必从一堆 `browser_*` 工具名里去猜。
+
+这次占用是刻意**可选**的，因为该服务虽然声明在 harness 的 API 目录中，但 0.2.1-rc.2 里没有任何随附包提供它：
+
+```js
+const browserUse = ctx.get('browserUse')   // 目前是 undefined
+if (browserUse === undefined) return () => {}  // 工具行为与此前完全一致
+```
+
+把它写成硬依赖在这里是错误的选择。把 `browserUse` 写进 `inject` 会让插件一直等待一个永不到来的服务，从而静默禁用全部浏览器工具 —— 这比「不带该声明照常运行」糟糕得多。插件卸载时会释放该槽位，因此重新加载可以再次占用；而占用被拒（已被另一个插件持有）只会作为诊断信息报告，不会抛出，因为工具才是真正的能力，槽位只是一个声明。
+
 ## 安全性
 
 工具继承内置浏览器已有的全部限制，不添加任何自身的放宽：
@@ -448,12 +462,42 @@ dsh plugin --profile desktop remove dsh-agent-browser
 ### 环境要求
 
 - **仅桌面端应用。**工具驱动 Electron `<webview>` guest。Web profile 渲染的是 sandbox 的跨源 `<iframe>`，其 DOM 无法读取，因此工具会报告指名 Web profile 的明确原因，而不是假装可用；`browser_tabs` 仍会把它列为 `mounted: true`、`carrier: "iframe"`。
-- **DSH `0.2.0-rc.2`** 是构建与验证所依据的版本。插件依赖公开契约（Inspect provider 注册表、`sidebar.right.tab.menu.item` 与 `settings.general.item` 座位，以及 `[data-sidebar-right-*]` DOM 属性），因此应能跨补丁更新存活 —— 但若某个契约发生迁移，请见*已知限制*。
+- **DSH `0.2.1-rc.2`** 是当前验证所依据的版本。插件依赖公开契约（Inspect provider 注册表、`sidebar.right.tab.menu.item` 与 `settings.general.item` 座位，以及 `[data-sidebar-right-*]` DOM 属性），因此应能跨补丁更新存活 —— 但如何验证的请见*版本适配*，若某个契约发生迁移请见*已知限制*。
 - **Node 20+** 用于运行测试套件。
+
+<a id="compatibility"></a>
+## 版本适配
+
+本插件最初针对更早的 DSH 编写，现已针对 **`0.2.1-rc.2`** 重新验证。为了让其继续工作**无需任何改动**；另外主动接入了 harness 新增的一个扩展点。
+
+### 验证了什么
+
+不是比对版本号 —— 而是把插件真正依赖的契约与真实包做了逐项 diff，并在真实运行中跑通：
+
+| 契约 | 结果 |
+|---|---|
+| `[data-sidebar-right-session]` / `-tab` / `-panel` / `-open` / `-occurrence` | 未变 |
+| `<webview data-sidebar-browser-frame="webview">` 载体标记 | 未变（桌面端 tab 仍声明 `keepMounted`） |
+| `sidebar.right.tab.menu.item`、`settings.general.item` 座位 | 未变；两者仍正常注册并出现 |
+| `ctx.cordisInspect.query('client', …)`、`ctx.sidebarRight.commandTarget` | 未变 |
+| `tools.register` / `tools.guard` / `attachments.saveImage` | 未变 |
+| `shortcuts.register`（`defaults` / `regions` / `aliases` / `resolve`） | 未变 |
+| `dsh.client` manifest（`platform` / `immediately` / `inject`） | 未变 |
+
+把 `0.2.1-rc.1` 与 `0.2.1-rc.2` 对比，`ui-sidebar-browser` 与 `ui-sidebar-right` 只有 CSS module 的构建哈希不同，`cordis-host-runner` 只有内部导出重命名 —— 插件触及的 API 没有任何一处移动。全部测试通过，且各工具已在真实应用里端到端跑过（`navigate`、`read`、`elements`、按预设 `screenshot`、`custom` 尺寸的 `viewport`、以及 `enableEval` 的拒绝路径）。
+
+### 接入了什么
+
+- **`browserUse` provider 槽位。** 详见上文*Provider 槽位*。注意这是面向未来的：`0.2.1-rc.2` 在 API 目录中声明了该服务，却没有任何实现，因此这次占用是条件式写下的、目前不会真正发生。等某个 harness 版本真的提供它时，插件无需再改就会成为浏览器自动化的声明式持有者。
+- **`peerDependencies`** 保持 `@deepseek-ai/cordis ~4.0.4`，该范围本就容纳随附的 `4.0.5`（`>=4.0.4 <4.1.0`）。改它只会收窄范围，故未动。
+
+### 如果未来版本真的弄坏了什么
+
+失败会是响亮的，而不是静默的：一旦插件无法挂在 `app.asar` 里的真实 Cordis 上，`runtime-mount-check` 会失败；一旦某个 Client 座位或工具结果形状移动，`client-check` / `contract-check` 会失败。在认定「坏了」之前，先对新安装跑一次 `node test/run-all.cjs` —— 它读取的是那次安装里的真实模块，而不是固定桩。
 
 ## 测试
 
-十一个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
+十四个套件，不使用测试框架 —— 都是失败即非零退出的普通 Node 脚本。可执行文件会自动定位（同级安装，或树上层的 `DeepSeek Harness.exe`）；通常你不需要传它。
 
 ```bash
 node test/run-all.cjs
@@ -467,7 +511,7 @@ node test/run-all.cjs "/path/to/DeepSeek Harness.exe"
 DSH_DESKTOP_EXE="/path/to/DeepSeek Harness.exe" node test/run-all.cjs
 ```
 
-有三个套件会从应用的 `app.asar` 导入真实校验器，因此没有打包好的安装就无法运行。在没有安装的机器上 —— 例如 CI —— 传 `--offline` 只跳过那三个；它们会报告为 `SKIP`，绝不报告为通过：
+有四个套件会从应用的 `app.asar` 导入真实模块，因此没有打包好的安装就无法运行。在没有安装的机器上 —— 例如 CI —— 传 `--offline` 只跳过那四个；它们会报告为 `SKIP`，绝不报告为通过：
 
 ```bash
 node test/run-all.cjs --offline
@@ -479,6 +523,7 @@ node test/run-all.cjs --offline
 | `client-check` | Client provider manifest、`pageCall` 代码生成、在 stub DOM 中的 guest 查找、`getViewport` 的隐式 tab 解析，以及 Web profile 的拒绝行为。 |
 | `page-helpers-check` | 读取 / 点击 / 输入 / 选择 / 拒绝路径，针对 DOM stub 运行；外加 `wait` 条件：成立时报 `matched`、不成立时**失败**而不是返回成功、`attached` 与 `visible` 保持为两个不同问题、`hidden` 接受「不存在」、非法选择器以「非法」而非「超时」被拒、以及不带条件的 `wait` 仍然只是睡眠。 |
 | `eval-gate-check` | Host 侧的 `enableEval` guard：`cordis_inspect_query` 绕过路径必须被拒；`browser_eval` 在关闭时仍**注册**但调用即拒绝并说明开关；开启时则确实到达 provider。 |
+| `browser-use-check` | 可选的 `browserUse` provider 占用：服务缺失时正常加载且不报错；服务存在时恰好占用一次并以插件名登记；占用被**拒**时全部工具仍照常注册；卸载时释放槽位 —— 包括「卸载之后才落定」的那次占用。 |
 | `viewport-check` | 尺寸计算、校验与钳制，以及 `setViewport` 的分发接线。 |
 | `apply-check` | `apply()` 激活与座位注册 —— 这一项失败意味着整个 client 半身失效。 |
 | `viewport-controller-check` | 哪个元素获得哪些内联样式、居中、回退、未挂载的 tab。 |
@@ -486,8 +531,10 @@ node test/run-all.cjs --offline
 | `session-scope-check` | 打开 tab 时以**发起调用的** Session 为地址，而不是屏幕上显示的那个；以及落进别的对话的 tab 会被如实点名，而不是被说成仅仅「未挂载」。 |
 | `resilience-check` | 卡死的页面会被插件预算兜住而不是拖住整次调用；视口改变是被确认的而不是被假定的；加载失败会被如实报告且被截图路径拒绝；无法执行脚本的卡死页面不会被当作空白图截下来；**未选中的 tab 仍能被截图（先聚焦、后还原）**、已经是绘制中的 tab 不会多此一举地动 tab 条、截图抛错时仍会还原用户原来的 tab、后台对话会被明确拒绝而不是拖到超时；截图失败会诊断可见性（对话不在屏幕上 / 侧边栏未展开 / 正在显示的是另一个 tab / 有证据地排除可见性），且绝不甩锅「不可达」或建议 reload；标签列举共享一个截止时间；reload / close 真的有效。看门狗把「挂住」变成失败 —— 没有它，移除被测的那道界限会让进程以 0 退出，看起来一片绿。 |
 | `host-error-check` | Host 如何解释一次失败的 Client 查询，且是纯 Node 检查因此在任何机器上都跑：**已经答复**的 provider 保留自己的诊断，不被说成「不可达」、也不被归咎于 Session 类型；provider/页面/方法确实缺席时保留「不可达」的解释；静默超时只提出可见性这一**可能性**而不作断言；被取消的调用与 schema 拒绝则原样透出。 |
+| `runtime-mount-check` | 插件能挂在 `app.asar` 里的**真实 Cordis**上，而不是手写假桩：`ctx.get('browserUse')` 是一次合法调用、在服务缺席时返回 `undefined` 而不抛错，且工具仍能经由框架自身异步的 `inject` 完成注册。 |
+| `readme-anchors` | 两份 README 里的每个页内链接都指向真实存在的标题或 `<a id>` —— 目录不会与它所指的章节悄悄脱节。 |
 
-其中三个必须在打包后的可执行文件里以 Node 模式运行，因为它们从 `app.asar` 导入真实校验器；`run-all.cjs` 会替你处理。
+其中四个必须在打包后的可执行文件里以 Node 模式运行，因为它们从 `app.asar` 导入真实模块；`run-all.cjs` 会替你处理。
 
 若干断言的存在，是因为曾经出过只在运行时才可见的 bug：遗漏 `shortcuts.register` 的 defaults 会静默让整个 client 半身失效；`jsx(type, props, key)` 把标签当作 React key 会渲染出空白按钮；`Modal` portal 到 kit 的点击穿透边界之外会让菜单自我关闭；视口高度被拉伸会破坏 `100vh`；新 tab 走 on-screen 入口打开，结果落进另一个对话，让那个对话的 agent 去驱动了错误项目的页面；以及一组**把失败伪装成成功**的报告缺陷：无约束的 guest 调用会固定卡满 60 秒、页面尚未重排就报告视口已改、加载失败的页面因为 Electron 的 URL 覆盖了页面的 URL 而看起来健康。
 

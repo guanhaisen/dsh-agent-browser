@@ -1,14 +1,15 @@
 /**
  * Run every dsh-agent-browser check.
  *
- * The two Electron-backed checks must run under the packaged executable in Node
- * mode, because they import the real `dsh-tools` validators out of `app.asar`.
- * This runner locates that executable and drives both, then runs the pure-Node
- * checks in this process.
+ * The Electron-backed checks must run under the packaged executable in Node
+ * mode, because they import real modules out of `app.asar` — the `dsh-tools`
+ * validators, the Client runtime, and the Cordis framework itself. This runner
+ * locates that executable and drives them, then runs the pure-Node checks in
+ * this process.
  *
  * Usage: node test/run-all.cjs ["<path to DeepSeek Harness.exe>"] [--offline]
  *
- * `--offline` skips the two checks that need a packaged install, so CI can run
+ * `--offline` skips the checks that need a packaged install, so CI can run
  * everything it is actually able to run instead of reporting a false failure.
  * Skipped checks are reported as SKIP, never as PASS.
  */
@@ -35,12 +36,14 @@ const exe = findExecutable()
 const pureChecks = [
   ['page helper behavior', 'page-helpers-check.cjs'],
   ['enableEval gate', 'eval-gate-check.cjs'],
+  ['browser-use provider slot', 'browser-use-check.cjs'],
   ['viewport sizing math', 'viewport-check.cjs'],
   ['client apply wiring', 'apply-check.cjs'],
   ['viewport controller behavior', 'viewport-controller-check.cjs'],
   ['tab opening stays in its Session', 'session-scope-check.cjs'],
   ['stalled pages, error pages and recovery', 'resilience-check.cjs'],
   ['host error explanations', 'host-error-check.cjs'],
+  ['README anchors resolve', 'readme-anchors.cjs'],
 ]
 
 // `--offline` is authoritative, not a fallback: it means "skip the checks
@@ -66,7 +69,12 @@ const electronEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_DESKTOP_EXE
 
 if (skipPackaged) {
   const reason = offline ? '--offline' : 'no packaged install found'
-  for (const label of ['tool + manifest schemas', 'client half wiring', 'tool result contracts']) {
+  for (const label of [
+    'tool + manifest schemas',
+    'client half wiring',
+    'tool result contracts',
+    'mounts on the real Cordis runtime',
+  ]) {
     results.push({ label, ok: true, status: 'skipped' })
     process.stdout.write(`\n=== ${label} ===\nSKIPPED (${reason}: needs a packaged install)\n`)
   }
@@ -74,6 +82,9 @@ if (skipPackaged) {
   run('tool + manifest schemas', exe, ['--expose-internals', join(here, 'schema-check.cjs')], { env: electronEnv })
   run('client half wiring', exe, ['--expose-internals', join(here, 'client-check.cjs')], { env: electronEnv })
   run('tool result contracts', exe, ['--expose-internals', join(here, 'contract-check.cjs')], { env: electronEnv })
+  run('mounts on the real Cordis runtime', exe, ['--expose-internals', join(here, 'runtime-mount-check.cjs')], {
+    env: electronEnv,
+  })
 }
 
 for (const [label, file] of pureChecks) {

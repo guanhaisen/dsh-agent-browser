@@ -32,6 +32,7 @@ browser_viewport { preset: "phone" }      -> re-render at 390×844
 - [Tools](#tools) — what the model can call
 - [Which size to use](#which-size-to-use) — pick desktop or phone, not the default
 - [Viewport sizes](#viewport-sizes-phone--desktop--custom) — the UI side
+- [Compatibility](#compatibility) — verified against DSH `0.2.1-rc.2`
 - [Known limitations](#known-limitations) — read before filing an issue
 
 ## Tools
@@ -490,6 +491,31 @@ The controls sit in public additive seats — `sidebar.right.tab.menu.item` and
 browser keeps working untouched and the whole feature disappears when the plugin
 is disabled.
 
+### Provider slot
+
+When the harness exposes the `browserUse` service, the Host half claims its
+exclusive provider slot under the name `dsh-agent-browser`. That slot is how a
+composition declares *which* plugin owns browser automation: it is single-owner,
+a second registration fails even when it repeats the same name, and holding it
+lets a future harness surface (or a competing plugin) see who the owner is
+instead of inferring it from a pile of `browser_*` tool names.
+
+The claim is deliberately **optional**, because the service is declared in the
+harness API catalog but is not provided by any shipped package in 0.2.1-rc.2:
+
+```js
+const browserUse = ctx.get('browserUse')   // undefined today
+if (browserUse === undefined) return () => {}  // tools work exactly as before
+```
+
+A hard dependency would be the wrong shape here. Writing `browserUse` into
+`inject` would make the plugin wait for a service that never arrives, silently
+disabling every browser tool — a much worse failure than running without the
+declaration. The claim is released when the plugin unloads, so a reload can take
+the slot again, and a rejected claim (another plugin already owns it) is reported
+as a diagnostic rather than thrown, because the tools are the actual capability
+and the slot is only a declaration.
+
 ## Safety
 
 The tools inherit every restriction the built-in browser already enforces, and
@@ -793,17 +819,65 @@ manager would try to replace the link and pnpm can fail with
 - **Desktop app only.** The tools drive an Electron `<webview>` guest. Web
   profiles render a sandboxed cross-origin `<iframe>` whose DOM cannot be read,
   so the tools report an explicit reason instead of pretending to work.
-- **DSH `0.2.0-rc.2`** was the version this was built and verified against.
-  The plugin relies on public contracts (the Inspect provider registry, the
+- **DSH `0.2.1-rc.2`** is the version this is verified against. The plugin relies
+  on public contracts (the Inspect provider registry, the
   `sidebar.right.tab.menu.item` and `settings.general.item` seats, and the
   `[data-sidebar-right-*]` DOM attributes), so it should survive patch updates —
-  but see *Known limitations* for what happens if a contract moves.
+  but see *Compatibility* for how that was checked, and *Known limitations* for
+  what happens if a contract moves.
 - **Node 20+** to run the test suite.
+
+## Compatibility
+
+The plugin was written against an earlier DSH and has since been re-verified
+against **`0.2.1-rc.2`**. Nothing needed changing to keep working; one new
+harness extension point was adopted.
+
+### What was checked
+
+Not a version-string comparison — the contracts the plugin actually depends on
+were diffed against the real packages, and the behaviour was exercised live:
+
+| Contract | Result |
+|---|---|
+| `[data-sidebar-right-session]` / `-tab` / `-panel` / `-open` / `-occurrence` | unchanged |
+| `<webview data-sidebar-browser-frame="webview">` carrier tag | unchanged (`keepMounted` still set for Desktop tabs) |
+| `sidebar.right.tab.menu.item`, `settings.general.item` seats | unchanged; both still register and appear |
+| `ctx.cordisInspect.query('client', …)`, `ctx.sidebarRight.commandTarget` | unchanged |
+| `tools.register` / `tools.guard` / `attachments.saveImage` | unchanged |
+| `shortcuts.register` (`defaults` / `regions` / `aliases` / `resolve`) | unchanged |
+| `dsh.client` manifest (`platform` / `immediately` / `inject`) | unchanged |
+
+Diffing `0.2.1-rc.1` against `0.2.1-rc.2` showed only CSS-module build hashes in
+`ui-sidebar-browser` and `ui-sidebar-right`, and internal export renames in
+`cordis-host-runner` — no API the plugin touches moved. The full suite passes,
+and the tools were exercised end to end against the live app (`navigate`, `read`,
+`elements`, `screenshot` at a preset, `viewport` with a `custom` size, the
+`enableEval` refusal).
+
+### What was adopted
+
+- **`browserUse` provider slot.** See *Provider slot* above. Note this is
+  forward-looking: `0.2.1-rc.2` declares the service in its API catalog but ships
+  no implementation, so the claim is written conditionally and currently never
+  fires. When a harness does provide it, the plugin becomes the declared owner of
+  browser automation with no further change.
+- **`peerDependencies`** stays at `@deepseek-ai/cordis ~4.0.4`, which already
+  admits the shipped `4.0.5` (`>=4.0.4 <4.1.0`). Bumping it would only narrow the
+  range, so it was left alone.
+
+### If a future version does break something
+
+The failure will be loud, not silent: the `runtime-mount-check` suite fails if the
+plugin can no longer mount on the real Cordis out of `app.asar`, and the
+`client-check` / `contract-check` suites fail if a Client seat or a tool result
+shape moves. Run `node test/run-all.cjs` against a new install before assuming a
+breakage — it reads the real modules out of that install rather than fixtures.
 
 
 ## Tests
 
-Eleven suites, no test framework — plain Node scripts that exit non-zero on
+Fourteen suites, no test framework — plain Node scripts that exit non-zero on
 failure. The executable is located automatically (a sibling install, or
 `DeepSeek Harness.exe` somewhere up the tree); normally you do not pass it.
 
@@ -819,9 +893,9 @@ node test/run-all.cjs "/path/to/DeepSeek Harness.exe"
 DSH_DESKTOP_EXE="/path/to/DeepSeek Harness.exe" node test/run-all.cjs
 ```
 
-Three suites import the real validators out of the application's `app.asar`, so
-they cannot run without a packaged install. On a machine that has none — CI, for
-instance — pass `--offline` to skip just those three; they are reported as
+Four suites import real modules out of the application's `app.asar`, so they
+cannot run without a packaged install. On a machine that has none — CI, for
+instance — pass `--offline` to skip just those four; they are reported as
 `SKIP`, never as a pass:
 
 ```bash
@@ -834,6 +908,7 @@ node test/run-all.cjs --offline
 | `client-check` | The Client provider manifest, `pageCall` codegen, guest lookup in a stub DOM, `getViewport`'s implicit-tab resolution, and the Web-profile refusal. |
 | `page-helpers-check` | Read / click / type / select / refusal paths, run against a DOM stub, plus the `wait` condition: that a met condition reports `matched`, that an unmet one FAILS rather than returning success, that `attached` and `visible` stay distinct questions, that `hidden` accepts absence, that an invalid selector is refused as invalid rather than as a timeout, and that a `wait` with no condition still just sleeps. |
 | `eval-gate-check` | The Host-side `enableEval` guard, including the `cordis_inspect_query` bypass. |
+| `browser-use-check` | The optional `browserUse` provider claim: absent service loads normally with no error, present service is claimed exactly once under the plugin name, a **rejected** claim still leaves every tool registered, and unloading releases the slot — including a claim that settles only after unload. |
 | `viewport-check` | Sizing math, validation and clamping, and `setViewport` dispatch wiring. |
 | `apply-check` | `apply()` activation and seat registration — if this fails, the whole client half is down. |
 | `viewport-controller-check` | Which element gets which inline style, centring, fallbacks, unmounted tabs. |
@@ -841,9 +916,11 @@ node test/run-all.cjs --offline
 | `session-scope-check` | That opening a tab is addressed to the **calling** Session, not the on-screen one, and that a tab landing in another Conversation is reported as such rather than as merely unmounted. |
 | `resilience-check` | That a stalled page is bounded by the plugin budget instead of stalling the call; that a viewport change is confirmed rather than assumed; that a failed load is reported as failed and refused by the screenshot path; that a wedged, unscriptable page is not captured as a blank image; **that a tab which is not the drawn one is still captured (focused first, previous tab restored), that a capture of the drawn tab moves nothing, that a capture which throws still restores the user's tab, and that an off-screen Conversation is refused plainly instead of timing out**; that a failed capture diagnoses visibility (hidden Conversation, collapsed Sidebar, another tab drawn, or visibility ruled out) and never blames reachability or prescribes reload; that a tab listing shares one deadline; and that reload/close actually work. A watchdog turns a hang into a failure — without it, removing the bound under test would make the process exit 0 and look green. |
 | `host-error-check` | How the Host explains a failed Client query, in pure Node so it runs everywhere: a provider that ANSWERED keeps its own diagnosis and is not called unreachable or blamed on the Session kind; a genuinely absent provider/page/method keeps the reachability explanation; a silent timeout names the visibility possibility without asserting it; and a cancelled call or a schema rejection passes through untouched. |
+| `runtime-mount-check` | That the plugin mounts on the **real Cordis** out of `app.asar`, not a hand-written fake: `ctx.get('browserUse')` is a legitimate call that returns `undefined` rather than throwing on the missing service, and the tools still register through the framework's own asynchronous `inject`. |
+| `readme-anchors` | That every in-page link in both READMEs resolves to a real heading or `<a id>` — the table of contents cannot drift away from the sections it names. |
 
-Three of these must run under the packaged executable in Node mode, because they
-import the real validators out of `app.asar`; `run-all.cjs` does that for you.
+Four of these must run under the packaged executable in Node mode, because they
+import real modules out of `app.asar`; `run-all.cjs` does that for you.
 
 Several assertions exist because a bug shipped once and was only visible at
 runtime: a missing `shortcuts.register` defaults map that silently took the
