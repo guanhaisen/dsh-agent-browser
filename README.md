@@ -217,14 +217,34 @@ tab of the on-screen pane is drawn, and **a hidden guest is not composited**. A
 capture aimed at a hidden tab waits for a frame that never arrives, which is why
 the failure "sticks", why `browser_read` keeps working against the same tab, and
 why **reloading does not help** (it cannot change whether a tab is being drawn).
-The fix is to make the tab the drawn one:
 
-> Click this tab in the right Sidebar so it becomes the shown one, then retry.
+**This no longer needs the user's help.** A capture aimed at a tab that is not the
+drawn one now borrows the selection for the duration of the call and gives it back
+afterwards: the app's own `focus(tabId)` layout operation — the one the tab strip
+performs on a click — moves the strip, the guest becomes composited, the frame is
+captured, and the tab the user was looking at is restored. Switching tabs in the
+Sidebar, or working in another Conversation, is therefore no longer a reason a
+screenshot fails.
 
-Every failed capture now says which of these it was, from the host DOM: an
-ancestor is hidden (the Conversation is not on screen), the Sidebar is collapsed,
-another tab is the one being shown (named), or visibility is ruled *out* because
-the tab really is the drawn one. When the shell exposes none of those signals the
+What remains is the one case that genuinely cannot be borrowed: a Conversation
+whose Sidebar is not on screen at all. The layout operations act on the mounted
+Session, so there is no surface to focus, and the call says so instead of waiting
+out a transport timeout. The result is a fast, actionable error rather than the
+old 60-second silence:
+
+> its Conversation is not on screen, so its Sidebar cannot be focused. Open this
+> Conversation, then retry.
+
+Two properties keep that borrowing safe. It happens only when the DOM *confirms*
+the tab is not drawn — never on a shell whose attributes this code cannot read, so
+ordinary captures gain no new failure mode. And the restore runs in a `finally`,
+so a capture that throws still puts the strip back where the user left it; a
+failed call never leaves the Sidebar on the agent's tab.
+
+Every failed capture still says which case it was, from the host DOM: an ancestor
+is hidden (the Conversation is not on screen), the Sidebar is collapsed, another
+tab is the one being shown (named), or visibility is ruled *out* because the tab
+really is the drawn one. When the shell exposes none of those signals the
 diagnosis says nothing rather than guessing — "ruled out" is only claimed from
 evidence.
 
@@ -819,7 +839,7 @@ node test/run-all.cjs --offline
 | `viewport-controller-check` | Which element gets which inline style, centring, fallbacks, unmounted tabs. |
 | `contract-check` | Every tool's **real** result shape — success and degradation — through the registry's own lossless-JSON detach and output-schema validation, plus the `truncated` flag's semantics and active-tab reporting. |
 | `session-scope-check` | That opening a tab is addressed to the **calling** Session, not the on-screen one, and that a tab landing in another Conversation is reported as such rather than as merely unmounted. |
-| `resilience-check` | That a stalled page is bounded by the plugin budget instead of stalling the call; that a viewport change is confirmed rather than assumed; that a failed load is reported as failed and refused by the screenshot path; that a wedged, unscriptable page is not captured as a blank image; that a failed capture diagnoses visibility (hidden Conversation, collapsed Sidebar, another tab drawn, or visibility ruled out) and never blames reachability or prescribes reload; that a tab listing shares one deadline; and that reload/close actually work. A watchdog turns a hang into a failure — without it, removing the bound under test would make the process exit 0 and look green. |
+| `resilience-check` | That a stalled page is bounded by the plugin budget instead of stalling the call; that a viewport change is confirmed rather than assumed; that a failed load is reported as failed and refused by the screenshot path; that a wedged, unscriptable page is not captured as a blank image; **that a tab which is not the drawn one is still captured (focused first, previous tab restored), that a capture of the drawn tab moves nothing, that a capture which throws still restores the user's tab, and that an off-screen Conversation is refused plainly instead of timing out**; that a failed capture diagnoses visibility (hidden Conversation, collapsed Sidebar, another tab drawn, or visibility ruled out) and never blames reachability or prescribes reload; that a tab listing shares one deadline; and that reload/close actually work. A watchdog turns a hang into a failure — without it, removing the bound under test would make the process exit 0 and look green. |
 | `host-error-check` | How the Host explains a failed Client query, in pure Node so it runs everywhere: a provider that ANSWERED keeps its own diagnosis and is not called unreachable or blamed on the Session kind; a genuinely absent provider/page/method keeps the reachability explanation; a silent timeout names the visibility possibility without asserting it; and a cancelled call or a schema rejection passes through untouched. |
 
 Three of these must run under the packaged executable in Node mode, because they

@@ -700,7 +700,193 @@ async function main() {
   }
 
   // ---------------------------------------------------------------------
-  // 5b. A capture that fails must say WHY, and the reason that actually
+  // 5c. A capture must not depend on the user having clicked the right tab.
+  //
+  // Only the SELECTED tab of an on-screen pane is composited, and a guest that
+  // is not composited never paints the frame `capturePage` waits for — which is
+  // why a screenshot used to fail while the same tab read perfectly well, and
+  // why reloading never helped. The fix borrows the app's own `focus(tabId)`
+  // layout operation for the duration of the capture and gives the strip back
+  // afterwards. Each assertion below is one way that could regress: not
+  // focusing at all, not giving the tab back, giving it back even when nothing
+  // was borrowed, or letting a capture that throws leave the strip moved.
+  // ---------------------------------------------------------------------
+  const captureFrames = async () => ({
+    getSize: () => ({ width: 10, height: 10 }),
+    resize() {
+      return this
+    },
+    toDataURL: () => 'data:image/png;base64,AAAA',
+  })
+
+  // The tab is not the drawn one: the capture must focus it first and restore
+  // the tab the user was actually looking at.
+  {
+    const guest = makeGuest({})
+    guest.capturePage = captureFrames
+    const sidebar = makeSidebarDom({
+      sessionId: SESSION,
+      tabIds: ['tab1', 'tab2'],
+      selectedTabId: 'tab2',
+    })
+    sidebar.wrappers[0].guest = guest
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    world.sidebar = sidebar
+    // Record every focus, and model the shell moving its own selection so the
+    // "is it drawn now" poll can succeed rather than waiting out its budget.
+    // The selected tab is reported through a title node whose `closest` resolves
+    // to the wrapper, which is exactly the shape the real strip maintains:
+    // `role=tab[aria-selected]` is the only reliable statement of "drawn".
+    const focused = []
+    let selected = 'tab2'
+    const selectedTitle = (tabId) => ({
+      closest: (selector) =>
+        selector === '[data-sidebar-right-tab]'
+          ? sidebar.wrappers.find((w) => w.dataset.sidebarRightTab === tabId) ?? null
+          : null,
+    })
+    world.sidebarRight.focus = (tabId) => {
+      focused.push(tabId)
+      selected = tabId
+    }
+    // The app's own answer for "which tab is active": the shipping shell reports
+    // it through `commandTarget()`, and the restore is derived from it.
+    world.sidebarRight.commandTarget = () => ({ sessionId: SESSION, tabId: selected })
+    sidebar.pane.querySelector = (selector) =>
+      selector === '[role="tab"][aria-selected="true"]' ? selectedTitle(selected) : null
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 500
+    bundle.budgets.screenshot = 2000
+
+    const shot = await bundle.provider.query('screenshot', { tabId: 'tab1' }, { sessionId: SESSION })
+    check('a tab that is not drawn is still captured', shot.base64 === 'AAAA', shot)
+    check('the capture focused the target tab first', focused[0] === 'tab1', focused)
+    check('the capture gave the previous tab back', focused[focused.length - 1] === 'tab2', focused)
+  }
+
+  // Already the drawn tab: nothing is borrowed, so nothing is restored — a
+  // capture that works today must not start moving the strip as a side effect.
+  {
+    const guest = makeGuest({})
+    guest.capturePage = captureFrames
+    const sidebar = makeSidebarDom({ sessionId: SESSION, tabIds: ['tab1'] })
+    sidebar.wrappers[0].guest = guest
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    world.sidebar = sidebar
+    const focused = []
+    world.sidebarRight.focus = (tabId) => focused.push(tabId)
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 500
+    bundle.budgets.screenshot = 2000
+
+    await bundle.provider.query('screenshot', {}, { sessionId: SESSION })
+    check('a capture of the drawn tab focuses nothing', focused.length === 0, focused)
+  }
+
+  // A capture that throws must still put the strip back. This is the case that
+  // would otherwise leave the user's Sidebar on the agent's tab after a failure,
+  // which is worse than the failure itself: nothing would ever move it back.
+  {
+    const guest = makeGuest({})
+    guest.capturePage = async () => {
+      throw new Error('UnknownVizError')
+    }
+    const sidebar = makeSidebarDom({
+      sessionId: SESSION,
+      tabIds: ['tab1', 'tab2'],
+      selectedTabId: 'tab2',
+    })
+    sidebar.wrappers[0].guest = guest
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    world.sidebar = sidebar
+    const focused = []
+    let selected = 'tab2'
+    const selectedTitle = (tabId) => ({
+      closest: (selector) =>
+        selector === '[data-sidebar-right-tab]'
+          ? sidebar.wrappers.find((w) => w.dataset.sidebarRightTab === tabId) ?? null
+          : null,
+    })
+    world.sidebarRight.focus = (tabId) => {
+      focused.push(tabId)
+      selected = tabId
+    }
+    // The app's own answer for "which tab is active": the shipping shell reports
+    // it through `commandTarget()`, and the restore is derived from it.
+    world.sidebarRight.commandTarget = () => ({ sessionId: SESSION, tabId: selected })
+    sidebar.pane.querySelector = (selector) =>
+      selector === '[role="tab"][aria-selected="true"]' ? selectedTitle(selected) : null
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 500
+    bundle.budgets.screenshot = 1500
+
+    try {
+      await bundle.provider.query('screenshot', { tabId: 'tab1' }, { sessionId: SESSION })
+    } catch {
+      // expected
+    }
+    check('a failed capture still restores the previous tab', focused[focused.length - 1] === 'tab2', focused)
+  }
+
+  // A Conversation that is not on screen has no surface to focus. That is worth
+  // saying plainly, because the alternative is a 60 s transport timeout that
+  // tells the caller nothing.
+  {
+    const guest = makeGuest({})
+    guest.capturePage = captureFrames
+    const sidebar = makeSidebarDom({
+      sessionId: SESSION,
+      tabIds: ['tab1', 'tab2'],
+      selectedTabId: 'tab2',
+    })
+    sidebar.wrappers[0].guest = guest
+    const world = makeWorld([{ sessionId: SESSION, tabId: 'tab1', guest }])
+    world.sidebar = sidebar
+    // The target tab is NOT the drawn one, which is what makes this a borrow
+    // attempt at all: a drawn tab needs nothing from the layout face, so the
+    // background-Conversation refusal would never be reached.
+    sidebar.pane.querySelector = (selector) =>
+      selector === '[role="tab"][aria-selected="true"]'
+        ? {
+            closest: (inner) =>
+              inner === '[data-sidebar-right-tab]'
+                ? sidebar.wrappers.find((w) => w.dataset.sidebarRightTab === 'tab2') ?? null
+                : null,
+          }
+        : null
+    world.sidebarRight.commandTarget = () => ({ sessionId: SESSION, tabId: 'tab2' })
+    world.sidebarRight.mounted = { getSnapshot: () => 'another-session' }
+    // The layout face exists — it is the CONVERSATION being off screen that must
+    // stop this, not a missing method. Without `focus` the borrow path would
+    // decline for the wrong reason and the assertion below would pass vacuously.
+    world.sidebarRight.focus = () => {
+      throw new Error('focus must not be attempted for an off-screen Conversation')
+    }
+    const bundle = loadBundle(world)
+    bundle.budgets.identity = 500
+    bundle.budgets.screenshot = 1500
+
+    let error
+    try {
+      await bundle.provider.query('screenshot', { tabId: 'tab1' }, { sessionId: SESSION })
+    } catch (thrown) {
+      error = thrown
+    }
+    check('a background Conversation cannot borrow a selection', error !== undefined, String(error))
+    check(
+      'and is told why, in terms it can act on',
+      /not\s+on\s+screen|Conversation is not on screen/.test(String(error?.message)),
+      String(error?.message),
+    )
+    check(
+      'the refusal is not a transport timeout',
+      !/timed out after 60000/.test(String(error?.message)),
+      String(error?.message),
+    )
+  }
+
+  // ---------------------------------------------------------------------
+  // 5d. A failed capture must say WHY, and the reason that actually
   // explains the reported failures is visibility: `keepMounted` keeps every
   // visited tab in the DOM, but only the selected tab of the on-screen pane is
   // drawn, and a hidden guest is not composited. The caller cannot see any of

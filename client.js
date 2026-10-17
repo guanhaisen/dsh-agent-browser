@@ -125,6 +125,25 @@ window.__ModuleLoader__.load({
     const REACTION_PAUSE_MS = 150
 
     /**
+     * How long a capture waits for a borrowed tab to become the drawn one.
+     *
+     * Focusing is a recorded layout operation and the resulting paint lands
+     * within a frame or two, so this only has to cover a scheduling hiccup. It
+     * is deliberately short: it is spent inside the screenshot budget, which
+     * still has to size, verify and capture afterwards.
+     */
+    const DRAWN_SETTLE_MS = 250
+
+    /**
+     * The diagnosis `visibleDiagnosis` returns when the tab IS being drawn.
+     *
+     * Shared as a constant because two callers depend on the exact wording: the
+     * failure message that reports it, and `isDrawn`, which uses it as the only
+     * positive answer among the reasons a tab is not composited.
+     */
+    const DRAWN_DIAGNOSIS = 'this tab is the one being drawn and the Sidebar is open, so visibility does not explain it'
+
+    /**
      * Start a per-call budget.
      * @param budgetMs - total budget for this call; defaults to the shared one.
      * @returns an absolute deadline in `Date.now()` terms.
@@ -1397,7 +1416,7 @@ window.__ModuleLoader__.load({
           // whose DOM exposes none of these signals (a stub, or a future shell
           // that renames them) gets no diagnosis rather than a false reassurance.
           if (panel !== null && panel !== undefined && sawSelection) {
-            return 'this tab is the one being drawn and the Sidebar is open, so visibility does not explain it'
+            return DRAWN_DIAGNOSIS
           }
           return undefined
         } catch {
@@ -1537,6 +1556,104 @@ window.__ModuleLoader__.load({
           // navigation rather than the document now on screen. Reported so a
           // caller never mistakes an inference for an observation.
           unverified: identity === undefined,
+        }
+      }
+
+      /**
+       * Whether a tab's guest is currently being drawn, read from the DOM.
+       *
+       * Three answers, not two. Only the SELECTED tab of an on-screen pane is
+       * composited, and a guest that is not composited never produces the frame
+       * `capturePage` waits for — that is the whole reason a capture can fail
+       * while the same tab reads perfectly well. But the shell's attributes are
+       * not a contract, so a DOM this code cannot read must say `undefined`
+       * rather than a guess: borrowing a selection nobody needed would make an
+       * ordinary capture depend on a layout operation that is allowed to fail.
+       * @param sessionId - owning Session.
+       * @param tabId - target tab.
+       * @returns true drawn, false known not drawn, undefined when unknown.
+       */
+      isDrawn(sessionId, tabId) {
+        const diagnosis = this.visibleDiagnosis(sessionId, tabId)
+        if (diagnosis === undefined) return undefined
+        // `visibleDiagnosis` states the drawn case explicitly; every other
+        // answer it gives is a reason this tab is NOT being drawn.
+        return diagnosis === DRAWN_DIAGNOSIS
+      }
+
+      /**
+       * Make a tab the drawn one for the duration of a capture, then undo it.
+       *
+       * A capture needs its guest composited, and only the selected tab of the
+       * on-screen pane is. `focus(tabId)` is the app's own recorded layout
+       * operation — the same one the tab strip performs on a click — so this
+       * borrows the user's gesture for a moment instead of asking them to stop
+       * what they are doing and click. The tab they were looking at is restored
+       * afterwards, so switching in the Sidebar, or working in another
+       * Conversation, no longer costs them a failed screenshot.
+       *
+       * Everything here is best-effort and reversible:
+       * - A Session that is not on screen cannot be focused at all (the layout
+       *   face acts on the mounted Session), and the caller is told so instead
+       *   of being handed a 60 s transport timeout.
+       * - A restore runs in a `finally`, so a capture that throws still puts the
+       *   strip back where the user left it.
+       * - The tab to restore is read BEFORE focusing, because it is the one the
+       *   user was looking at when the call arrived.
+       * @param sessionId - owning Session.
+       * @param tabId - the tab that must be drawn for the capture.
+       * @returns an async restore function, or undefined when nothing was borrowed.
+       */
+      async borrowDrawnTab(sessionId, tabId, deadline) {
+        const drawn = this.isDrawn(sessionId, tabId)
+        // `true` is the drawn tab, and `undefined` is a DOM this code cannot
+        // read: in both cases there is nothing worth borrowing, and making an
+        // ordinary capture depend on a layout operation would add a failure mode
+        // to calls that work today. Only a CONFIRMED "not drawn" borrows.
+        if (drawn !== false) return undefined
+        const sidebar = this.ctx.sidebarRight
+        if (sidebar === undefined || typeof sidebar.focus !== 'function') {
+          // No way to borrow the selection. Attempting the capture anyway is
+          // still the better answer: the tab may be drawn for a reason this code
+          // cannot read, and a real capture either succeeds or fails with the
+          // provider's own reason. Refusing here would replace that reason with
+          // a guess, which is exactly the mistake an earlier build made.
+          return undefined
+        }
+        const previous = this.activeTabId(sessionId)
+        // A background Conversation has no surface of its own to focus: the
+        // layout operations act on whatever Session is mounted. Saying so is far
+        // more useful than letting the capture time out.
+        const onScreen = sidebar.mounted?.getSnapshot?.()
+        if (onScreen !== sessionId) {
+          throw new Error(
+            'this tab needs to be the drawn one for the capture, but its Conversation is not on ' +
+              'screen, so its Sidebar cannot be focused. Open this Conversation, then retry — or ' +
+              'capture a tab in the Conversation you are looking at.',
+          )
+        }
+        try {
+          sidebar.focus(tabId)
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          throw new Error(`the tab could not be focused for the capture: ${reason}`)
+        }
+        // Focusing is a recorded layout operation, not a synchronous paint: give
+        // the strip a couple of frames to make the guest the composited one, and
+        // stop waiting the moment it is.
+        const settleUntil = Math.min(Date.now() + DRAWN_SETTLE_MS, Date.now() + Math.max(0, budgetLeft(deadline)))
+        while (Date.now() < settleUntil) {
+          if (this.isDrawn(sessionId, tabId)) break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        return async () => {
+          if (previous === undefined || previous === tabId) return
+          try {
+            sidebar.focus(previous)
+          } catch {
+            // The user's tab is a courtesy, not part of the answer: a restore
+            // that fails must not turn a delivered screenshot into an error.
+          }
         }
       }
 
@@ -1865,6 +1982,36 @@ window.__ModuleLoader__.load({
         const { guest, carrier } = this.resolve(sessionId, tabId)
         this.requireDrivable(carrier, 'be captured')
 
+        // A capture only sees what is COMPOSITED, and only the selected tab of
+        // an on-screen pane is. Borrow the selection for the duration of this
+        // call and give it back afterwards, so a user who switched tabs or is
+        // working in another Conversation is not the reason a screenshot fails.
+        // This runs before sizing: a viewport change on a guest that is not
+        // being drawn cannot be confirmed either.
+        const releaseDrawn = await this.borrowDrawnTab(sessionId, tabId, deadline)
+        try {
+          return await this.captureDrawn(sessionId, tabId, guest, input, deadline)
+        } finally {
+          // Hand the strip back exactly as it was found, including when the
+          // capture threw: the borrowed selection is the user's, not this call's.
+          if (releaseDrawn !== undefined) await releaseDrawn()
+        }
+      }
+
+      /**
+       * Size, verify and capture a guest that is already the drawn tab.
+       *
+       * Split from `screenshot` so the borrowed selection has exactly one
+       * restore point: whatever this throws, the caller's `finally` still puts
+       * the tab strip back.
+       * @param sessionId - owning Session.
+       * @param tabId - the tab being captured.
+       * @param guest - its webview element.
+       * @param input - maximum width and an optional preset to apply.
+       * @param deadline - when this call's budget runs out.
+       * @returns the screenshot payload.
+       */
+      async captureDrawn(sessionId, tabId, guest, input, deadline) {
         // Apply the requested size before capturing, if one was named. Only a
         // webview can be sized, which `requireDrivable` has already established.
         let frame
@@ -1945,8 +2092,8 @@ window.__ModuleLoader__.load({
             `the screenshot failed: ${reason}` +
               (visibility === undefined ? '' : ` — ${visibility}`) +
               '. The page was readable at the same moment, so the browser itself is fine: this is ' +
-              'the capture path. Click this tab in the right Sidebar so it is the one being drawn ' +
-              '(a hidden tab is not composited), or capture a different tab.',
+              'the capture path. The tab was made the drawn one for this call, so a capture that ' +
+              'still fails is not about which tab is selected: retry, or capture a different tab.',
           )
         }
         const original = image.getSize()
